@@ -1,0 +1,13 @@
+{
+  "images" : [
+    {
+      "filename" : "mari-spalsh.png",
+      "idiom" : "universal",
+      "scale" : "1x"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}
