@@ -432,6 +432,10 @@ struct ServicesScreen: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 28)
         }
+        .scrollIndicators(.hidden)
+        .mariPullToRefresh {
+            await store.reload()
+        }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
         .task {
@@ -524,6 +528,10 @@ private struct ServicesCategoryScreen: View {
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 28)
+        }
+        .scrollIndicators(.hidden)
+        .mariPullToRefresh {
+            await store.reload()
         }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
@@ -675,6 +683,10 @@ private struct ServiceEditorScreen: View {
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 28)
+        }
+        .scrollIndicators(.hidden)
+        .mariPullToRefresh {
+            await store.reload()
         }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
@@ -886,6 +898,10 @@ private struct ServiceCategoryEditorScreen: View {
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 28)
+        }
+        .scrollIndicators(.hidden)
+        .mariPullToRefresh {
+            await store.reload()
         }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)

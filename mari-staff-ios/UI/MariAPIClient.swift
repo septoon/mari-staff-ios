@@ -3,6 +3,12 @@ import Network
 import OSLog
 import Security
 
+private nonisolated(unsafe) extension Data {
+    mutating func appendUTF8(_ value: String) {
+        append(Data(value.utf8))
+    }
+}
+
 private struct RawHTTPResponse {
     let statusCode: Int
     let headers: [String: String]
@@ -212,6 +218,18 @@ actor MariAPIClient {
         let staff: StaffRecord
     }
 
+    struct StaffAvatarMutationResponse: Codable {
+        let staffId: String
+        let avatarUrl: String?
+        let avatarAssetId: String?
+        let previousAvatarAssetId: String?
+    }
+
+    struct FireStaffMutationResponse: Codable {
+        let staff: StaffRecord
+        let cancelledFutureAppointments: Int
+    }
+
     struct StaffPage: Codable {
         let items: [StaffRecord]
     }
@@ -234,6 +252,7 @@ actor MariAPIClient {
         let role: String
         let phoneE164: String
         let email: String?
+        let receivesAllAppointmentNotifications: Bool
         let avatarUrl: String?
         let isActive: Bool
         let position: PositionSnapshot?
@@ -251,6 +270,10 @@ actor MariAPIClient {
         let client: ClientRecord
     }
 
+    struct MediaAssetUploadResponse: Codable {
+        let id: String
+    }
+
     struct DeleteClientResponse: Codable {
         let deleted: Bool
         let clientId: String
@@ -258,6 +281,19 @@ actor MariAPIClient {
 
     struct AppointmentsPage: Codable {
         let items: [AppointmentRecord]
+    }
+
+    struct CreateAppointmentPayload: Encodable {
+        struct ClientPayload: Encodable {
+            let name: String
+            let phone: String
+        }
+
+        let startAt: String
+        let staffId: String
+        let anyStaff: Bool
+        let serviceIds: [String]
+        let client: ClientPayload
     }
 
     struct ServicesPage: Codable {
@@ -716,6 +752,25 @@ actor MariAPIClient {
 
         struct PrivacyPolicyPayload: Codable {
             let content: String
+
+            init(content: String) {
+                self.content = content
+            }
+
+            private enum CodingKeys: String, CodingKey {
+                case content
+            }
+
+            init(from decoder: Decoder) throws {
+                if let container = try? decoder.singleValueContainer(),
+                   let rawValue = try? container.decode(String.self) {
+                    content = rawValue
+                    return
+                }
+
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                content = try container.decodeIfPresent(String.self, forKey: .content) ?? ""
+            }
         }
 
         let notifications: NotificationsPayload
@@ -1087,6 +1142,39 @@ actor MariAPIClient {
         )
     }
 
+    func getCurrentStaffProfile() async throws -> StaffRecord {
+        do {
+            let payload = try await request(
+                path: "/staff/me",
+                method: "GET",
+                body: Optional<String>.none,
+                requiresAuth: true,
+                allowRefresh: true,
+                as: StaffMutationEnvelope.self
+            )
+            return payload.staff
+        } catch {
+            let identity = try await me()
+            return StaffRecord(
+                id: identity.id,
+                name: identity.name,
+                role: identity.role,
+                phoneE164: identity.phoneE164,
+                email: identity.email,
+                receivesAllAppointmentNotifications: identity.role == "OWNER",
+                avatarUrl: nil,
+                isActive: true,
+                position: nil,
+                hiredAt: nil,
+                firedAt: nil,
+                deletedAt: nil,
+                permissions: identity.permissions?.map {
+                    StaffRecord.PermissionSnapshot(code: $0, expiresAt: nil)
+                }
+            )
+        }
+    }
+
     func getClient(id: String) async throws -> ClientRecord {
         try await request(
             path: "/clients/\(id)",
@@ -1133,6 +1221,73 @@ actor MariAPIClient {
             as: StaffMutationEnvelope.self
         )
         return payload.staff
+    }
+
+    func updateStaffAppointmentNotifications(
+        id: String,
+        receivesAllAppointmentNotifications: Bool
+    ) async throws -> StaffRecord {
+        let payload = try await request(
+            path: "/staff/\(id)/appointment-notifications",
+            method: "PATCH",
+            body: ["receivesAllAppointmentNotifications": receivesAllAppointmentNotifications],
+            requiresAuth: true,
+            allowRefresh: true,
+            as: StaffMutationEnvelope.self
+        )
+        return payload.staff
+    }
+
+    func fireStaff(id: String, firedAt: Date = Date()) async throws -> FireStaffMutationResponse {
+        struct Payload: Encodable {
+            let firedAt: String
+        }
+
+        return try await request(
+            path: "/staff/\(id)/fire",
+            method: "POST",
+            body: Payload(firedAt: makeISOString(from: firedAt)),
+            requiresAuth: true,
+            allowRefresh: true,
+            as: FireStaffMutationResponse.self
+        )
+    }
+
+    func uploadStaffAvatarAsset(image: MariPreparedUploadImage) async throws -> MediaAssetUploadResponse {
+        try await requestMultipart(
+            path: "/client-front/staff/media/upload",
+            method: "POST",
+            formFields: ["entity": "specialists"],
+            fileFieldName: "file",
+            fileName: image.fileName,
+            mimeType: image.mimeType,
+            fileData: image.data,
+            requiresAuth: true,
+            allowRefresh: true,
+            as: MediaAssetUploadResponse.self
+        )
+    }
+
+    func updateStaffAvatar(id: String, photoAssetId: String?) async throws -> StaffAvatarMutationResponse {
+        try await request(
+            path: "/staff/\(id)/avatar",
+            method: "PATCH",
+            body: ["photoAssetId": photoAssetId],
+            requiresAuth: true,
+            allowRefresh: true,
+            as: StaffAvatarMutationResponse.self
+        )
+    }
+
+    func deleteStaffMediaAsset(id: String) async throws {
+        _ = try await request(
+            path: "/client-front/staff/media/\(id)",
+            method: "DELETE",
+            body: Optional<String>.none,
+            requiresAuth: true,
+            allowRefresh: true,
+            as: DeleteMutationEnvelope.self
+        )
     }
 
     func listStaffServices(id: String) async throws -> StaffServicesPage {
@@ -1280,6 +1435,34 @@ actor MariAPIClient {
         return payload.client
     }
 
+    func uploadClientAvatar(id: String, image: MariPreparedUploadImage) async throws -> ClientRecord {
+        let payload = try await requestMultipart(
+            path: "/clients/\(id)/avatar",
+            method: "POST",
+            formFields: [:],
+            fileFieldName: "file",
+            fileName: image.fileName,
+            mimeType: image.mimeType,
+            fileData: image.data,
+            requiresAuth: true,
+            allowRefresh: true,
+            as: ClientMutationResponse.self
+        )
+        return payload.client
+    }
+
+    func deleteClientAvatar(id: String) async throws -> ClientRecord {
+        let payload = try await request(
+            path: "/clients/\(id)/avatar",
+            method: "DELETE",
+            body: Optional<String>.none,
+            requiresAuth: true,
+            allowRefresh: true,
+            as: ClientMutationResponse.self
+        )
+        return payload.client
+    }
+
     func updateClientPermanentDiscount(id: String, percent: Double?) async throws -> ClientRecord {
         struct DiscountPayload: Encodable {
             struct Payload: Encodable {
@@ -1355,6 +1538,32 @@ actor MariAPIClient {
             requiresAuth: true,
             allowRefresh: true,
             as: AppointmentsPage.self
+        )
+    }
+
+    func createAppointment(
+        startAt: Date,
+        staffId: String,
+        serviceIDs: [String],
+        clientName: String,
+        clientPhone: String
+    ) async throws -> AppointmentRecord {
+        try await request(
+            path: "/appointments",
+            method: "POST",
+            body: CreateAppointmentPayload(
+                startAt: makeISOString(from: startAt),
+                staffId: staffId,
+                anyStaff: false,
+                serviceIds: serviceIDs,
+                client: CreateAppointmentPayload.ClientPayload(
+                    name: clientName,
+                    phone: clientPhone
+                )
+            ),
+            requiresAuth: true,
+            allowRefresh: true,
+            as: AppointmentRecord.self
         )
     }
 
@@ -1890,6 +2099,107 @@ actor MariAPIClient {
         return try decodeResponse(Response.self, from: data, httpResponse: httpResponse)
     }
 
+    private func requestMultipart<Response: Decodable>(
+        path: String,
+        method: String,
+        formFields: [String: String],
+        fileFieldName: String,
+        fileName: String,
+        mimeType: String,
+        fileData: Data,
+        requiresAuth: Bool,
+        allowRefresh: Bool,
+        as _: Response.Type
+    ) async throws -> Response {
+        let baseURL = try resolvedBaseURL()
+
+        guard let url = URL(string: baseURL + path) else {
+            throw APIClientError.invalidURL
+        }
+
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var urlRequest = URLRequest(url: url)
+        urlRequest.httpMethod = method
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        urlRequest.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        urlRequest.httpBody = buildMultipartBody(
+            boundary: boundary,
+            formFields: formFields,
+            fileFieldName: fileFieldName,
+            fileName: fileName,
+            mimeType: mimeType,
+            fileData: fileData
+        )
+
+        if requiresAuth, let accessToken = session?.tokens.accessToken {
+            urlRequest.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        }
+
+        let transport: TransportResult
+        do {
+            transport = try await performRequest(urlRequest)
+        } catch let error as URLError {
+            throw apiError(for: error, url: url)
+        }
+
+        let data = transport.data
+        let response = transport.response
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIClientError.invalidResponse
+        }
+
+        if httpResponse.statusCode == 401, requiresAuth, allowRefresh {
+            _ = try await refresh()
+            return try await requestMultipart(
+                path: path,
+                method: method,
+                formFields: formFields,
+                fileFieldName: fileFieldName,
+                fileName: fileName,
+                mimeType: mimeType,
+                fileData: fileData,
+                requiresAuth: requiresAuth,
+                allowRefresh: false,
+                as: Response.self
+            )
+        }
+
+        if httpResponse.statusCode >= 500 {
+            throw APIClientError.serverUnavailable(statusCode: httpResponse.statusCode)
+        }
+
+        return try decodeResponse(Response.self, from: data, httpResponse: httpResponse)
+    }
+
+    private func buildMultipartBody(
+        boundary: String,
+        formFields: [String: String],
+        fileFieldName: String,
+        fileName: String,
+        mimeType: String,
+        fileData: Data
+    ) -> Data {
+        var body = Data()
+
+        for key in formFields.keys.sorted() {
+            guard let value = formFields[key] else { continue }
+            body.appendUTF8("--\(boundary)\r\n")
+            body.appendUTF8("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
+            body.appendUTF8("\(value)\r\n")
+        }
+
+        body.appendUTF8("--\(boundary)\r\n")
+        body.appendUTF8(
+            "Content-Disposition: form-data; name=\"\(fileFieldName)\"; filename=\"\(fileName)\"\r\n"
+        )
+        body.appendUTF8("Content-Type: \(mimeType)\r\n\r\n")
+        body.append(fileData)
+        body.appendUTF8("\r\n")
+        body.appendUTF8("--\(boundary)--\r\n")
+
+        return body
+    }
+
     private func decodeResponse<Response: Decodable>(
         _ type: Response.Type,
         from data: Data,
@@ -2259,5 +2569,12 @@ actor MariAPIClient {
         }
 
         return nil
+    }
+
+    private func makeISOString(from date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter.string(from: date)
     }
 }

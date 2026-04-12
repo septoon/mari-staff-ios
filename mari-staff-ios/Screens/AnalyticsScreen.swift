@@ -303,7 +303,7 @@ struct AnalyticsScreen: View {
                         AnalyticsMetricCard(
                             title: "Завершенные",
                             value: "\(snapshot.completedAppointments)",
-                            subtitle: "Arrived, Done, Completed",
+                            subtitle: "Пришел, выполнено, завершено",
                             accent: Color(hex: 0x20804A)
                         )
                         AnalyticsMetricCard(
@@ -325,25 +325,22 @@ struct AnalyticsScreen: View {
                             title: "Выручка",
                             value: snapshot.totalRevenue.analyticsMoney,
                             subtitle: "Все услуги за период",
-                            accent: Color(hex: 0x9B7322)
+                            accent: Color(hex: 0x9B7322),
+                            valueFontSize: 24
                         )
                         AnalyticsMetricCard(
                             title: "Оплачено",
                             value: snapshot.totalPaid.analyticsMoney,
                             subtitle: "Сумма оплаченных визитов",
-                            accent: Color(hex: 0x20804A)
+                            accent: Color(hex: 0x20804A),
+                            valueFontSize: 24
                         )
                         AnalyticsMetricCard(
                             title: "Средний чек",
                             value: snapshot.averageCheck.analyticsMoney,
                             subtitle: "Выручка / количество записей",
-                            accent: MariPalette.ink
-                        )
-                        AnalyticsMetricCard(
-                            title: "API overview",
-                            value: overviewValue,
-                            subtitle: overviewSubtitle,
-                            accent: overviewAccent
+                            accent: MariPalette.ink,
+                            valueFontSize: 24
                         )
                     }
 
@@ -376,6 +373,10 @@ struct AnalyticsScreen: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 28)
         }
+        .scrollIndicators(.hidden)
+        .mariPullToRefresh {
+            await store.reload()
+        }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
         .task {
@@ -383,28 +384,6 @@ struct AnalyticsScreen: View {
         }
     }
 
-    private var overviewValue: String {
-        if let revenue = store.overview?.money?.revenue {
-            return revenue.analyticsMoney
-        }
-        switch store.syncState {
-        case .success: return "OK"
-        case .loading: return "..."
-        case .error, .idle: return "Локально"
-        }
-    }
-
-    private var overviewSubtitle: String {
-        store.syncMessage.isEmpty ? "Статус серверной аналитики" : store.syncMessage
-    }
-
-    private var overviewAccent: Color {
-        switch store.syncState {
-        case .success: return Color(hex: 0x20804A)
-        case .loading: return Color(hex: 0x2D5FD6)
-        case .error, .idle: return Color(hex: 0xC06B54)
-        }
-    }
 }
 
 private struct AnalyticsHeader: View {
@@ -652,30 +631,14 @@ private struct AnalyticsChartCard: View {
                 .font(.system(size: 22, weight: .black, design: .rounded))
                 .foregroundStyle(MariPalette.ink)
 
-            HStack(spacing: 8) {
-                ForEach(AnalyticsChartMode.allCases) { item in
-                    Button {
-                        mode = item
-                    } label: {
-                        Text(item.title)
-                            .font(.caption.weight(.bold))
-                            .foregroundStyle(mode == item ? MariPalette.ink : MariPalette.softInk)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 9)
-                            .background(
-                                Capsule()
-                                    .fill(mode == item ? MariPalette.accent : .white.opacity(0.8))
-                                    .overlay(
-                                        Capsule()
-                                            .stroke(Color.black.opacity(mode == item ? 0 : 0.08), lineWidth: mode == item ? 0 : 1)
-                                    )
-                            )
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
+            AnalyticsChartModeControl(selection: $mode)
 
-            AnalyticsLineChart(series: series, currencyMode: currencyMode)
+            AnalyticsChartSummaryStrip(
+                series: series,
+                currencyMode: currencyMode
+            )
+
+            AnalyticsLineChart(series: series)
                 .frame(height: 220)
         }
         .padding(18)
@@ -683,14 +646,114 @@ private struct AnalyticsChartCard: View {
     }
 }
 
-private struct AnalyticsLineChart: View {
+private struct AnalyticsChartModeControl: View {
+    @Binding var selection: AnalyticsChartMode
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(AnalyticsChartMode.allCases) { item in
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        selection = item
+                    }
+                } label: {
+                    Text(item.title)
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundStyle(selection == item ? MariPalette.ink : MariPalette.softInk)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 52)
+                        .background {
+                            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                                .fill(selection == item ? .white.opacity(0.96) : .clear)
+                                .shadow(
+                                    color: Color.black.opacity(selection == item ? 0.06 : 0),
+                                    radius: 10,
+                                    x: 0,
+                                    y: 4
+                                )
+                        }
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(6)
+        .background {
+            RoundedRectangle(cornerRadius: 30, style: .continuous)
+                .fill(Color.white.opacity(0.74))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 30, style: .continuous)
+                        .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                }
+        }
+    }
+}
+
+private struct AnalyticsChartSummaryStrip: View {
     let series: [AnalyticsBucket]
     let currencyMode: Bool
+
+    private var visibleSeries: [AnalyticsBucket] {
+        pickVisibleBucketIndices(for: series.count).compactMap { index in
+            series.indices.contains(index) ? series[index] : nil
+        }
+    }
+
+    var body: some View {
+        if !visibleSeries.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(visibleSeries) { item in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(MariPalette.accent)
+                                    .frame(width: 7, height: 7)
+
+                                Text(item.shortLabel.uppercased())
+                                    .font(.caption2.weight(.bold))
+                                    .tracking(0.8)
+                                    .foregroundStyle(MariPalette.softInk)
+                            }
+
+                            Text(formattedValue(item.value))
+                                .font(.system(size: 16, weight: .black, design: .rounded))
+                                .foregroundStyle(MariPalette.ink)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.72)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .frame(minWidth: 90, alignment: .leading)
+                        .background {
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .fill(.white.opacity(0.82))
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .stroke(Color.black.opacity(0.05), lineWidth: 1)
+                                }
+                        }
+                    }
+                }
+                .padding(.horizontal, 1)
+            }
+            .scrollIndicators(.hidden)
+        }
+    }
+
+    private func formattedValue(_ value: Double) -> String {
+        currencyMode ? value.analyticsMoney : "\(Int(value.rounded()))"
+    }
+}
+
+private struct AnalyticsLineChart: View {
+    let series: [AnalyticsBucket]
 
     var body: some View {
         GeometryReader { proxy in
             let points = polylinePoints(in: proxy.size)
-            let visibleLabels = pickVisibleLabels()
+            let visibleIndices = pickVisibleBucketIndices(for: series.count)
 
             VStack(spacing: 0) {
                 ZStack(alignment: .topLeading) {
@@ -716,24 +779,22 @@ private struct AnalyticsLineChart: View {
                             .fill(MariPalette.accent)
                             .frame(width: 10, height: 10)
                             .position(point)
-                            .overlay(alignment: .top) {
-                                if series.indices.contains(index) {
-                                    Text(formattedValue(series[index].value))
-                                        .font(.caption2.weight(.bold))
-                                        .foregroundStyle(MariPalette.ink)
-                                        .offset(y: -18)
-                                }
-                            }
                     }
                 }
                 .frame(height: proxy.size.height - 42)
 
-                HStack {
-                    ForEach(visibleLabels) { item in
-                        Text(item.shortLabel)
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(MariPalette.softInk)
-                            .frame(maxWidth: .infinity)
+                ZStack(alignment: .topLeading) {
+                    ForEach(visibleIndices, id: \.self) { index in
+                        if points.indices.contains(index), series.indices.contains(index) {
+                            Text(series[index].shortLabel)
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(MariPalette.softInk)
+                                .frame(width: 44)
+                                .position(
+                                    x: clampedLabelX(for: points[index].x, width: proxy.size.width),
+                                    y: 12
+                                )
+                        }
                     }
                 }
                 .frame(height: 42)
@@ -761,25 +822,26 @@ private struct AnalyticsLineChart: View {
         }
     }
 
-    private func pickVisibleLabels() -> [AnalyticsBucket] {
-        if series.count <= 6 {
-            return series
-        }
+    private func clampedLabelX(for x: CGFloat, width: CGFloat) -> CGFloat {
+        min(max(22, x), max(22, width - 22))
+    }
+}
 
-        let step = max(1, (series.count - 1) / 5)
-        var indices = Set([0, series.count - 1])
-        var index = step
-        while index < series.count - 1 {
-            indices.insert(index)
-            index += step
-        }
-
-        return indices.sorted().compactMap { series.indices.contains($0) ? series[$0] : nil }
+private func pickVisibleBucketIndices(for count: Int) -> [Int] {
+    guard count > 0 else { return [] }
+    if count <= 6 {
+        return Array(0..<count)
     }
 
-    private func formattedValue(_ value: Double) -> String {
-        currencyMode ? value.analyticsMoney : "\(Int(value.rounded()))"
+    let step = max(1, (count - 1) / 5)
+    var indices = Set([0, count - 1])
+    var index = step
+    while index < count - 1 {
+        indices.insert(index)
+        index += step
     }
+
+    return indices.sorted()
 }
 
 private struct AnalyticsMetricCard: View {
@@ -787,6 +849,21 @@ private struct AnalyticsMetricCard: View {
     let value: String
     let subtitle: String
     let accent: Color
+    let valueFontSize: CGFloat
+
+    init(
+        title: String,
+        value: String,
+        subtitle: String,
+        accent: Color,
+        valueFontSize: CGFloat = 28
+    ) {
+        self.title = title
+        self.value = value
+        self.subtitle = subtitle
+        self.accent = accent
+        self.valueFontSize = valueFontSize
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -796,8 +873,10 @@ private struct AnalyticsMetricCard: View {
                 .foregroundStyle(MariPalette.softInk)
 
             Text(value)
-                .font(.system(size: 28, weight: .black, design: .rounded))
+                .font(.system(size: valueFontSize, weight: .black, design: .rounded))
                 .foregroundStyle(accent)
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
 
             Text(subtitle)
                 .font(.footnote.weight(.semibold))
@@ -1291,7 +1370,20 @@ private extension Date {
 
 private extension Double {
     var analyticsMoney: String {
-        MariFormatters.currency.string(from: NSNumber(value: self)) ?? "\(Int(self.rounded())) ₽"
+        let value = self
+
+        if value >= 1_000_000 {
+            let shortened = value / 1_000_000
+            return "\(shortened.formatted(.number.precision(.fractionLength(0...1)))) млн ₽"
+        }
+
+        if value >= 1_000 {
+            let shortened = value / 1_000
+            return "\(shortened.formatted(.number.precision(.fractionLength(0...1)))) тыс ₽"
+        }
+
+        return MariFormatters.currency.string(from: NSNumber(value: value))
+            ?? "\(Int(value.rounded())) ₽"
     }
 
     var formattedPercent: String {

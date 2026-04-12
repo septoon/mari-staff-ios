@@ -1,5 +1,6 @@
 import Charts
 import Combine
+import PhotosUI
 import SwiftUI
 
 private enum ClientSegment: String, CaseIterable, Identifiable {
@@ -140,10 +141,13 @@ private struct ClientAnalyticsSummary: Identifiable {
 private final class ClientsStore: ObservableObject {
     @Published private(set) var clients: [MariAPIClient.ClientRecord] = []
     @Published private(set) var appointments: [MariAPIClient.AppointmentRecord] = []
+    @Published private(set) var summaries: [ClientAnalyticsSummary] = []
+    @Published private(set) var filteredSummaries: [ClientAnalyticsSummary] = []
     @Published private(set) var isLoading = false
     @Published private(set) var detailLoading = false
     @Published private(set) var isSaving = false
     @Published private(set) var isDeleting = false
+    @Published private(set) var avatarBusy = false
     @Published var errorMessage = ""
     @Published var query = ""
     @Published var segment: ClientSegment = .all
@@ -163,12 +167,14 @@ private final class ClientsStore: ObservableObject {
     private let decoder = JSONDecoder()
     private var session: StaffSession?
     private var hasLoaded = false
+    private var cancellables: Set<AnyCancellable> = []
 
     init(apiClient: MariAPIClient, session: StaffSession?) {
         self.apiClient = apiClient
         self.session = session
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
+        setupDerivedState()
     }
 
     func updateSession(_ session: StaffSession?) {
@@ -184,6 +190,12 @@ private final class ClientsStore: ObservableObject {
 
     var canManageDiscounts: Bool {
         isOwner || permissions.contains("MANAGE_CLIENT_DISCOUNTS")
+    }
+
+    var canManageAvatars: Bool {
+        isOwner ||
+            mariHasPermissionAccess(session, permissionCode: "EDIT_CLIENTS") ||
+            mariHasPermissionAccess(session, permissionCode: "MANAGE_CLIENT_AVATARS")
     }
 
     func loadIfNeeded() async {
@@ -258,6 +270,34 @@ private final class ClientsStore: ObservableObject {
         }
     }
 
+    func uploadSelectedClientAvatar(_ image: MariPreparedUploadImage) async {
+        guard canManageAvatars, let client = selectedClient else { return }
+        avatarBusy = true
+        errorMessage = ""
+        defer { avatarBusy = false }
+
+        do {
+            let updated = try await apiClient.uploadClientAvatar(id: client.id, image: image)
+            upsert(updated)
+        } catch {
+            errorMessage = localizedMessage(for: error)
+        }
+    }
+
+    func deleteSelectedClientAvatar() async {
+        guard canManageAvatars, let client = selectedClient else { return }
+        avatarBusy = true
+        errorMessage = ""
+        defer { avatarBusy = false }
+
+        do {
+            let updated = try await apiClient.deleteClientAvatar(id: client.id)
+            upsert(updated)
+        } catch {
+            errorMessage = localizedMessage(for: error)
+        }
+    }
+
     func deleteSelectedClient() async {
         guard let client = selectedClient else { return }
         isDeleting = true
@@ -268,6 +308,8 @@ private final class ClientsStore: ObservableObject {
             _ = try await apiClient.deleteClient(id: client.id)
             clients.removeAll { $0.id == client.id }
             appointments.removeAll { $0.client.id == client.id }
+            rebuildSummaries()
+            persistCache()
             closeDetails()
         } catch {
             errorMessage = localizedMessage(for: error)
@@ -344,6 +386,7 @@ private final class ClientsStore: ObservableObject {
         } else {
             clients.append(client)
         }
+        rebuildSummaries()
         persistCache()
     }
 
@@ -403,6 +446,7 @@ private final class ClientsStore: ObservableObject {
                 appointments = fetchedAppointments
             }
             if clientsChanged || appointmentsChanged {
+                rebuildSummaries()
                 persistCache()
             }
         } catch {
@@ -417,6 +461,7 @@ private final class ClientsStore: ObservableObject {
         guard let payload = try? decoder.decode(ClientsCachePayload.self, from: data) else { return }
         clients = payload.clients
         appointments = payload.appointments
+        rebuildSummaries()
     }
 
     private func persistCache() {
@@ -471,49 +516,52 @@ private final class ClientsStore: ObservableObject {
 
         return lines.joined(separator: "\n")
     }
-}
 
-struct ClientsScreen: View {
-    let sessionStore: AppSessionStore
-    @StateObject private var store: ClientsStore
-    @State private var showsStartupSkeleton = true
-
-    init(sessionStore: AppSessionStore) {
-        self.sessionStore = sessionStore
-        _store = StateObject(wrappedValue: ClientsStore(apiClient: sessionStore.api, session: sessionStore.currentSession))
+    private func setupDerivedState() {
+        Publishers.CombineLatest4($query, $segment, $activityFilter, $sortMode)
+            .combineLatest($summaries)
+            .map { [weak self] filters, summaries in
+                guard let self else { return summaries }
+                let (query, segment, activityFilter, sortMode) = filters
+                return self.filterSummaries(
+                    summaries,
+                    query: query,
+                    segment: segment,
+                    activityFilter: activityFilter,
+                    sortMode: sortMode
+                )
+            }
+            .receive(on: RunLoop.main)
+            .assign(to: \.filteredSummaries, on: self)
+            .store(in: &cancellables)
     }
 
-    private var summaries: [ClientAnalyticsSummary] {
-        let lookup = buildAppointmentLookup(appointments: store.appointments)
-        return store.clients.map { client in
+    private func rebuildSummaries() {
+        let lookup = buildAppointmentLookup(appointments: appointments)
+        summaries = clients.map { client in
             buildSummary(client: client, appointments: linkedAppointments(for: client, lookup: lookup))
         }
     }
 
-    private var summaryByClientID: [String: ClientAnalyticsSummary] {
-        Dictionary(uniqueKeysWithValues: summaries.map { ($0.id, $0) })
-    }
-
-    private var segmentCounts: [ClientSegment: Int] {
-        let now = Date()
-        return ClientSegment.allCases.reduce(into: [:]) { partial, segment in
-            partial[segment] = segment == .all ? summaries.count : summaries.filter { resolvedSegment(for: $0, now: now) == segment }.count
-        }
-    }
-
-    private var filteredSummaries: [ClientAnalyticsSummary] {
-        let search = normalizedSearch(store.query)
+    private func filterSummaries(
+        _ items: [ClientAnalyticsSummary],
+        query: String,
+        segment: ClientSegment,
+        activityFilter: ActivityFilter,
+        sortMode: SortMode
+    ) -> [ClientAnalyticsSummary] {
+        let search = normalizedSearch(query)
         let now = Date()
 
-        return summaries
+        return items
             .filter { summary in
-                if store.segment != .all, resolvedSegment(for: summary, now: now) != store.segment {
+                if segment != .all, resolvedSegment(for: summary, now: now) != segment {
                     return false
                 }
-                if store.activityFilter == .visited, summary.totalVisits == 0 {
+                if activityFilter == .visited, summary.totalVisits == 0 {
                     return false
                 }
-                if store.activityFilter == .withoutVisits, summary.totalVisits > 0 {
+                if activityFilter == .withoutVisits, summary.totalVisits > 0 {
                     return false
                 }
                 if search.isEmpty {
@@ -523,12 +571,60 @@ struct ClientsScreen: View {
                     summary.client.phoneE164.contains(search) ||
                     (summary.client.email ?? "").lowercased().contains(search)
             }
-            .sorted(by: sortPredicate(lhs:rhs:))
+            .sorted { lhs, rhs in
+                self.sortPredicate(lhs: lhs, rhs: rhs, sortMode: sortMode)
+            }
+    }
+
+    private func sortPredicate(lhs: ClientAnalyticsSummary, rhs: ClientAnalyticsSummary, sortMode: SortMode) -> Bool {
+        switch sortMode {
+        case .recent:
+            return (lhs.lastVisit ?? .distantPast) > (rhs.lastVisit ?? .distantPast)
+        case .visits:
+            if lhs.totalVisits == rhs.totalVisits {
+                return lhs.client.displayName < rhs.client.displayName
+            }
+            return lhs.totalVisits > rhs.totalVisits
+        case .revenue:
+            if lhs.totalRevenue == rhs.totalRevenue {
+                return lhs.client.displayName < rhs.client.displayName
+            }
+            return lhs.totalRevenue > rhs.totalRevenue
+        }
+    }
+}
+
+struct ClientsScreen: View {
+    let sessionStore: AppSessionStore
+    @StateObject private var store: ClientsStore
+    @State private var showsStartupSkeleton = true
+    @State private var visibleSummaryCount = 40
+
+    private let pageSize = 40
+
+    init(sessionStore: AppSessionStore) {
+        self.sessionStore = sessionStore
+        _store = StateObject(wrappedValue: ClientsStore(apiClient: sessionStore.api, session: sessionStore.currentSession))
+    }
+
+    private var segmentCounts: [ClientSegment: Int] {
+        let now = Date()
+        return ClientSegment.allCases.reduce(into: [:]) { partial, segment in
+            partial[segment] = segment == .all ? store.summaries.count : store.summaries.filter { resolvedSegment(for: $0, now: now) == segment }.count
+        }
+    }
+
+    private var displayedSummaries: [ClientAnalyticsSummary] {
+        Array(store.filteredSummaries.prefix(visibleSummaryCount))
+    }
+
+    private var hasMoreSummaries: Bool {
+        displayedSummaries.count < store.filteredSummaries.count
     }
 
     private var selectedSummary: ClientAnalyticsSummary? {
         guard let selectedClientID = store.selectedClientID else { return nil }
-        return summaryByClientID[selectedClientID]
+        return store.summaries.first(where: { $0.id == selectedClientID })
     }
 
     private var isShowingSkeleton: Bool {
@@ -536,7 +632,9 @@ struct ClientsScreen: View {
     }
 
     var body: some View {
-        MariScrollContainer {
+        MariScrollContainer(onRefresh: {
+            await store.reload()
+        }) {
             if isShowingSkeleton {
                 ClientsInitialSkeleton()
             } else {
@@ -601,16 +699,16 @@ struct ClientsScreen: View {
                                 .tracking(1.4)
                                 .foregroundStyle(MariPalette.softInk.opacity(0.64))
 
-                            Text("\(filteredSummaries.count)")
+                            Text("\(store.filteredSummaries.count)")
                                 .font(.system(size: 34, weight: .black, design: .rounded))
                                 .foregroundStyle(MariPalette.ink)
                         }
 
-                        if filteredSummaries.isEmpty, !store.isLoading {
+                        if store.filteredSummaries.isEmpty, !store.isLoading {
                             ClientsEmptyState()
                         } else {
-                            VStack(spacing: 12) {
-                                ForEach(filteredSummaries) { summary in
+                            LazyVStack(spacing: 12) {
+                                ForEach(displayedSummaries) { summary in
                                     ClientCard(
                                         summary: summary,
                                         segment: resolvedSegment(for: summary, now: Date()),
@@ -618,6 +716,13 @@ struct ClientsScreen: View {
                                     ) {
                                         store.select(summary: summary)
                                     }
+                                }
+
+                                if hasMoreSummaries {
+                                    ClientsPaginator(
+                                        remainingCount: store.filteredSummaries.count - displayedSummaries.count,
+                                        action: loadNextPage
+                                    )
                                 }
                             }
                         }
@@ -649,25 +754,30 @@ struct ClientsScreen: View {
         .task {
             store.updateSession(sessionStore.currentSession)
             await store.loadIfNeeded()
+            resetPagination()
             showsStartupSkeleton = false
+        }
+        .onChange(of: store.query) { _, _ in
+            resetPagination()
+        }
+        .onChange(of: store.segment) { _, _ in
+            resetPagination()
+        }
+        .onChange(of: store.activityFilter) { _, _ in
+            resetPagination()
+        }
+        .onChange(of: store.sortMode) { _, _ in
+            resetPagination()
         }
     }
 
-    private func sortPredicate(lhs: ClientAnalyticsSummary, rhs: ClientAnalyticsSummary) -> Bool {
-        switch store.sortMode {
-        case .recent:
-            return (lhs.lastVisit ?? .distantPast) > (rhs.lastVisit ?? .distantPast)
-        case .visits:
-            if lhs.totalVisits == rhs.totalVisits {
-                return lhs.client.displayName < rhs.client.displayName
-            }
-            return lhs.totalVisits > rhs.totalVisits
-        case .revenue:
-            if lhs.totalRevenue == rhs.totalRevenue {
-                return lhs.client.displayName < rhs.client.displayName
-            }
-            return lhs.totalRevenue > rhs.totalRevenue
-        }
+    private func loadNextPage() {
+        MariHaptics.navigationTap()
+        visibleSummaryCount = min(visibleSummaryCount + pageSize, store.filteredSummaries.count)
+    }
+
+    private func resetPagination() {
+        visibleSummaryCount = pageSize
     }
 }
 
@@ -678,7 +788,10 @@ private struct ClientCard: View {
     let onTap: () -> Void
 
     var body: some View {
-        Button(action: onTap) {
+        Button {
+            MariHaptics.navigationTap()
+            onTap()
+        } label: {
             HStack(alignment: .top, spacing: 12) {
                 ClientAvatarView(
                     title: summary.client.displayName,
@@ -1039,6 +1152,40 @@ private struct ClientsMetaPill: View {
     }
 }
 
+private struct ClientsPaginator: View {
+    let remainingCount: Int
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Text("Показать еще")
+                    .font(.subheadline.weight(.bold))
+                Text("\(remainingCount)")
+                    .font(.caption.weight(.black))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background {
+                        Capsule()
+                            .fill(MariPalette.accent.opacity(0.22))
+                    }
+            }
+            .foregroundStyle(MariPalette.ink)
+            .frame(maxWidth: .infinity)
+            .frame(height: 50)
+            .background {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.white.opacity(0.88))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .stroke(Color.black.opacity(0.05), lineWidth: 1)
+                    }
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 private struct ClientAvatarView: View {
     let title: String
     let avatarURL: String?
@@ -1104,6 +1251,7 @@ private struct ClientDetailsSheet: View {
     let summary: ClientAnalyticsSummary
     let mediaBaseURL: String
     @State private var confirmsDelete = false
+    @State private var selectedPhotoItem: PhotosPickerItem?
 
     private var activeClient: MariAPIClient.ClientRecord {
         store.selectedClient ?? summary.client
@@ -1140,9 +1288,18 @@ private struct ClientDetailsSheet: View {
         buildRevenueSeries(appointments: statsItems, from: store.statsFrom, to: store.statsTo)
     }
 
+    private var avatarActionTitle: String {
+        if store.avatarBusy {
+            return "Загружаю фото..."
+        }
+        return activeClient.avatarUrl == nil ? "Добавить фото" : "Изменить фото"
+    }
+
     var body: some View {
         NavigationStack {
-            MariScrollContainer {
+            MariScrollContainer(onRefresh: {
+                await store.reload()
+            }) {
                 HStack(alignment: .top, spacing: 12) {
                     HStack(alignment: .top, spacing: 10) {
                         ClientAvatarView(
@@ -1198,8 +1355,64 @@ private struct ClientDetailsSheet: View {
                     }
                 }
 
+                if store.isEditing && store.canManageAvatars {
+                    HStack(spacing: 10) {
+                        PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                            Label(
+                                avatarActionTitle,
+                                systemImage: "photo"
+                            )
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(MariPalette.ink)
+                            .lineLimit(1)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background {
+                                Capsule()
+                                    .fill(Color.white.opacity(0.92))
+                                    .overlay {
+                                        Capsule()
+                                            .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                                    }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(store.avatarBusy || store.isSaving || store.isDeleting)
+
+                        if activeClient.avatarUrl != nil {
+                            Button {
+                                Task { await store.deleteSelectedClientAvatar() }
+                            } label: {
+                                Label("Удалить фото", systemImage: "trash")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(Color(hex: 0x9A5447))
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 10)
+                                    .background {
+                                        Capsule()
+                                            .fill(Color.white.opacity(0.92))
+                                            .overlay {
+                                                Capsule()
+                                                    .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                                            }
+                                    }
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(store.avatarBusy || store.isSaving || store.isDeleting)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 if store.detailLoading {
                     ProgressView("Обновляю карточку")
+                        .font(.footnote.weight(.semibold))
+                        .tint(MariPalette.accent)
+                }
+
+                if store.avatarBusy {
+                    ProgressView("Загружаю аватар")
                         .font(.footnote.weight(.semibold))
                         .tint(MariPalette.accent)
                 }
@@ -1246,6 +1459,24 @@ private struct ClientDetailsSheet: View {
                 Button("Отмена", role: .cancel) {}
             } message: {
                 Text("Будут удалены клиент и связанные записи, как в backend staff.")
+            }
+            .onChange(of: selectedPhotoItem) { _, newValue in
+                guard let newValue else { return }
+                Task {
+                    defer { selectedPhotoItem = nil }
+                    do {
+                        guard let rawData = try await newValue.loadTransferable(type: Data.self) else {
+                            throw MariImagePreparationError.unreadableImage
+                        }
+                        let image = try MariImagePreparation.prepareWebPImage(
+                            from: rawData,
+                            suggestedBaseName: activeClient.id
+                        )
+                        await store.uploadSelectedClientAvatar(image)
+                    } catch {
+                        store.errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    }
+                }
             }
         }
     }

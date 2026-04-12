@@ -1,4 +1,5 @@
 import Combine
+import PhotosUI
 import SwiftUI
 
 private typealias SettingsNotificationSection = MariAPIClient.StaffSettingsPayload.NotificationsPayload.SectionPayload
@@ -66,6 +67,7 @@ private struct StaffListRowModel: Identifiable, Hashable {
 private final class MoreStore: ObservableObject {
     @Published private(set) var currentStaff: MariAPIClient.StaffRecord?
     @Published private(set) var allStaff: [MariAPIClient.StaffRecord] = []
+    @Published private(set) var clientFrontSpecialistsByStaffID: [String: MariAPIClient.ClientFrontSpecialistRecord] = [:]
     @Published private(set) var serviceCounts: [String: Int] = [:]
     @Published private(set) var servicesByStaff: [String: [MariAPIClient.StaffServiceRecord]] = [:]
     @Published private(set) var permissionsByStaff: [String: [MariAPIClient.StaffPermissionRecord]] = [:]
@@ -83,12 +85,16 @@ private final class MoreStore: ObservableObject {
     @Published private(set) var savingServicesStaffID: String?
     @Published private(set) var permissionBusyStaffID: String?
     @Published private(set) var permissionBusyCode: String?
+    @Published private(set) var appointmentNotificationsBusyStaffID: String?
+    @Published private(set) var onlineBookingVisibilityBusyStaffID: String?
+    @Published private(set) var avatarBusyStaffID: String?
     @Published private(set) var busyNotificationIDs: Set<String> = []
     @Published private(set) var errorMessage = ""
 
     let session: StaffSession?
     private let apiClient: MariAPIClient
     private var hasLoaded = false
+    private var hasLoadedClientFrontSpecialists = false
 
     init(apiClient: MariAPIClient, session: StaffSession?) {
         self.apiClient = apiClient
@@ -124,6 +130,48 @@ private final class MoreStore: ObservableObject {
         session?.staff.role == "OWNER"
     }
 
+    var canManageStaffMedia: Bool {
+        mariHasPermissionAccess(session, permissionCode: "MANAGE_MEDIA")
+    }
+
+    var canEditOnlineBooking: Bool {
+        mariHasPermissionAccess(session, permissionCode: "MANAGE_CLIENT_FRONT")
+    }
+
+    var canFireStaff: Bool {
+        session?.staff.role == "OWNER"
+    }
+
+    func isUpdatingAppointmentNotifications(for staffID: String) -> Bool {
+        appointmentNotificationsBusyStaffID == staffID
+    }
+
+    func isUpdatingAvatar(for staffID: String) -> Bool {
+        avatarBusyStaffID == staffID
+    }
+
+    func isUpdatingOnlineBookingVisibility(for staffID: String) -> Bool {
+        onlineBookingVisibilityBusyStaffID == staffID
+    }
+
+    func canManageAvatar(for staffID: String) -> Bool {
+        guard let session else { return false }
+
+        if session.staff.id == staffID {
+            return true
+        }
+
+        if session.staff.role == "OWNER" {
+            return true
+        }
+
+        if canManageStaffMedia && mariHasPermissionAccess(self.session, permissionCode: "EDIT_STAFF") {
+            return true
+        }
+
+        return false
+    }
+
     func loadIfNeeded() async {
         guard !hasLoaded else { return }
         hasLoaded = true
@@ -142,26 +190,34 @@ private final class MoreStore: ObservableObject {
         defer { isLoading = false }
 
         do {
-            let staffResponse = try await apiClient.listStaff(
-                page: 1,
-                limit: 200,
-                role: nil,
-                isActive: nil,
-                employmentStatus: "all"
-            )
-            let filteredStaff = staffResponse.items
-                .filter { $0.role != "OWNER" || $0.id == session?.staff.id }
-                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            currentStaff = try await apiClient.getCurrentStaffProfile()
 
-            allStaff = filteredStaff
-            currentStaff = filteredStaff.first(where: { $0.id == session?.staff.id }) ?? fallbackCurrentStaff()
+            if mariHasPermissionAccess(session, permissionCode: "VIEW_STAFF") {
+                let staffResponse = try await apiClient.listStaff(
+                    page: 1,
+                    limit: 200,
+                    role: nil,
+                    isActive: nil,
+                    employmentStatus: "all"
+                )
+                let filteredStaff = staffResponse.items
+                    .filter { $0.role != "OWNER" || $0.id == session?.staff.id }
+                    .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
 
-            loadingStaffServicesIDs = Set(filteredStaff.map(\.id))
-            let countPairs = try await loadStaffServices(for: filteredStaff)
-            loadingStaffServicesIDs = []
+                allStaff = filteredStaff
+                currentStaff = filteredStaff.first(where: { $0.id == session?.staff.id }) ?? currentStaff ?? fallbackCurrentStaff()
 
-            serviceCounts = Dictionary(uniqueKeysWithValues: countPairs.map { ($0.0, $0.1) })
-            servicesByStaff = Dictionary(uniqueKeysWithValues: countPairs.map { ($0.0, $0.2) })
+                loadingStaffServicesIDs = Set(filteredStaff.map(\.id))
+                let countPairs = try await loadStaffServices(for: filteredStaff)
+                loadingStaffServicesIDs = []
+
+                serviceCounts = Dictionary(uniqueKeysWithValues: countPairs.map { ($0.0, $0.1) })
+                servicesByStaff = Dictionary(uniqueKeysWithValues: countPairs.map { ($0.0, $0.2) })
+            } else {
+                allStaff = []
+                serviceCounts = [:]
+                servicesByStaff = [:]
+            }
 
             try? await loadSettings()
         } catch {
@@ -207,6 +263,22 @@ private final class MoreStore: ObservableObject {
         do {
             let payload = try await apiClient.listStaffPermissions(id: staffID)
             permissionsByStaff[staffID] = payload.items
+        } catch {
+            errorMessage = localizedMessage(for: error)
+        }
+    }
+
+    func loadClientFrontSpecialistsIfNeeded(force: Bool = false) async {
+        guard canEditOnlineBooking else { return }
+        if !force, hasLoadedClientFrontSpecialists {
+            return
+        }
+
+        do {
+            let payload = try await apiClient.listClientFrontSpecialists()
+            clientFrontSpecialistsByStaffID = Dictionary(uniqueKeysWithValues: payload.items.map { ($0.staffId, $0) })
+            hasLoadedClientFrontSpecialists = true
+            errorMessage = ""
         } catch {
             errorMessage = localizedMessage(for: error)
         }
@@ -356,6 +428,48 @@ private final class MoreStore: ObservableObject {
         errorMessage = ""
     }
 
+    func updateStaffAppointmentNotifications(
+        staffID: String,
+        receivesAllAppointmentNotifications: Bool
+    ) async throws {
+        appointmentNotificationsBusyStaffID = staffID
+        defer { appointmentNotificationsBusyStaffID = nil }
+
+        let updated = try await apiClient.updateStaffAppointmentNotifications(
+            id: staffID,
+            receivesAllAppointmentNotifications: receivesAllAppointmentNotifications
+        )
+        mergeStaff(updated)
+        errorMessage = ""
+    }
+
+    func updateStaffOnlineBookingVisibility(
+        staffID: String,
+        isVisible: Bool
+    ) async throws {
+        onlineBookingVisibilityBusyStaffID = staffID
+        defer { onlineBookingVisibilityBusyStaffID = nil }
+
+        try await apiClient.patchClientFrontSpecialist(staffId: staffID, isVisible: isVisible)
+        _ = try await apiClient.publishClientFront()
+        hasLoadedClientFrontSpecialists = false
+        await loadClientFrontSpecialistsIfNeeded(force: true)
+        errorMessage = ""
+    }
+
+    func fireStaff(staffID: String) async throws {
+        actionLoading = true
+        defer { actionLoading = false }
+
+        let payload = try await apiClient.fireStaff(id: staffID)
+        mergeStaff(payload.staff)
+        errorMessage = ""
+    }
+
+    func clientFrontSpecialist(staffID: String) -> MariAPIClient.ClientFrontSpecialistRecord? {
+        clientFrontSpecialistsByStaffID[staffID]
+    }
+
     func loadSettings() async throws {
         let settings = try await apiClient.getStaffSettings()
         privacyPolicyText = settings.privacyPolicy.content
@@ -453,7 +567,7 @@ private final class MoreStore: ObservableObject {
         email: String?,
         positionName: String?,
         role: String
-    ) async throws {
+    ) async throws -> MariAPIClient.StaffRecord {
         actionLoading = true
         defer { actionLoading = false }
 
@@ -468,6 +582,68 @@ private final class MoreStore: ObservableObject {
             updated = try await apiClient.updateStaffRole(id: id, role: role)
         }
         mergeStaff(updated)
+        return updated
+    }
+
+    func saveOwnProfile(
+        id: String,
+        name: String,
+        phone: String,
+        email: String?
+    ) async throws -> MariAPIClient.StaffRecord {
+        actionLoading = true
+        defer { actionLoading = false }
+
+        let updated = try await apiClient.updateStaffContact(
+            id: id,
+            name: name,
+            phone: phone,
+            email: email,
+            positionName: nil
+        )
+        mergeStaff(updated)
+        return updated
+    }
+
+    func uploadStaffAvatar(
+        staffID: String,
+        image: MariPreparedUploadImage
+    ) async throws {
+        guard canManageAvatar(for: staffID) else {
+            throw MariAPIClient.APIClientError.forbidden(message: "Нет прав на управление аватаром сотрудника")
+        }
+
+        avatarBusyStaffID = staffID
+        defer { avatarBusyStaffID = nil }
+
+        let uploaded = try await apiClient.uploadStaffAvatarAsset(image: image)
+        do {
+            let linked = try await apiClient.updateStaffAvatar(id: staffID, photoAssetId: uploaded.id)
+            applyStaffAvatar(staffID: staffID, avatarURL: linked.avatarUrl)
+
+            if let previousAvatarAssetId = linked.previousAvatarAssetId {
+                try? await apiClient.deleteStaffMediaAsset(id: previousAvatarAssetId)
+            }
+        } catch {
+            try? await apiClient.deleteStaffMediaAsset(id: uploaded.id)
+            throw error
+        }
+    }
+
+    func deleteStaffAvatar(staffID: String) async throws {
+        guard canManageAvatar(for: staffID) else {
+            throw MariAPIClient.APIClientError.forbidden(message: "Нет прав на управление аватаром сотрудника")
+        }
+
+        avatarBusyStaffID = staffID
+        defer { avatarBusyStaffID = nil }
+
+        let linked = try await apiClient.updateStaffAvatar(id: staffID, photoAssetId: nil)
+        applyStaffAvatar(staffID: staffID, avatarURL: nil)
+
+        if let previousAvatarAssetId = linked.previousAvatarAssetId {
+            try? await apiClient.deleteStaffMediaAsset(id: previousAvatarAssetId)
+        }
     }
 
     private func mergeStaff(_ staff: MariAPIClient.StaffRecord) {
@@ -492,6 +668,7 @@ private final class MoreStore: ObservableObject {
                 role: existing.role,
                 phoneE164: existing.phoneE164,
                 email: existing.email,
+                receivesAllAppointmentNotifications: existing.receivesAllAppointmentNotifications,
                 avatarUrl: existing.avatarUrl,
                 isActive: existing.isActive,
                 position: existing.position,
@@ -509,6 +686,7 @@ private final class MoreStore: ObservableObject {
                 role: currentStaff.role,
                 phoneE164: currentStaff.phoneE164,
                 email: currentStaff.email,
+                receivesAllAppointmentNotifications: currentStaff.receivesAllAppointmentNotifications,
                 avatarUrl: currentStaff.avatarUrl,
                 isActive: currentStaff.isActive,
                 position: currentStaff.position,
@@ -520,6 +698,45 @@ private final class MoreStore: ObservableObject {
         }
     }
 
+    private func applyStaffAvatar(staffID: String, avatarURL: String?) {
+        if let index = allStaff.firstIndex(where: { $0.id == staffID }) {
+            let existing = allStaff[index]
+            allStaff[index] = MariAPIClient.StaffRecord(
+                id: existing.id,
+                name: existing.name,
+                role: existing.role,
+                phoneE164: existing.phoneE164,
+                email: existing.email,
+                receivesAllAppointmentNotifications: existing.receivesAllAppointmentNotifications,
+                avatarUrl: avatarURL,
+                isActive: existing.isActive,
+                position: existing.position,
+                hiredAt: existing.hiredAt,
+                firedAt: existing.firedAt,
+                deletedAt: existing.deletedAt,
+                permissions: existing.permissions
+            )
+        }
+
+        if currentStaff?.id == staffID, let currentStaff {
+            self.currentStaff = MariAPIClient.StaffRecord(
+                id: currentStaff.id,
+                name: currentStaff.name,
+                role: currentStaff.role,
+                phoneE164: currentStaff.phoneE164,
+                email: currentStaff.email,
+                receivesAllAppointmentNotifications: currentStaff.receivesAllAppointmentNotifications,
+                avatarUrl: avatarURL,
+                isActive: currentStaff.isActive,
+                position: currentStaff.position,
+                hiredAt: currentStaff.hiredAt,
+                firedAt: currentStaff.firedAt,
+                deletedAt: currentStaff.deletedAt,
+                permissions: currentStaff.permissions
+            )
+        }
+    }
+
     private func mergedStaff(existing: MariAPIClient.StaffRecord?, updated: MariAPIClient.StaffRecord) -> MariAPIClient.StaffRecord {
         MariAPIClient.StaffRecord(
             id: updated.id,
@@ -527,6 +744,7 @@ private final class MoreStore: ObservableObject {
             role: updated.role,
             phoneE164: updated.phoneE164,
             email: updated.email,
+            receivesAllAppointmentNotifications: updated.receivesAllAppointmentNotifications,
             avatarUrl: updated.avatarUrl ?? existing?.avatarUrl,
             isActive: updated.isActive,
             position: updated.position ?? existing?.position,
@@ -545,6 +763,7 @@ private final class MoreStore: ObservableObject {
             role: session.staff.role,
             phoneE164: session.staff.phoneE164,
             email: session.staff.email,
+            receivesAllAppointmentNotifications: session.staff.role == "OWNER",
             avatarUrl: nil,
             isActive: true,
             position: nil,
@@ -604,21 +823,22 @@ struct MoreScreen: View {
                                 store: store,
                                 staffID: currentStaff.id,
                                 initialStaff: currentStaff,
+                                mode: .selfProfile,
                                 onSave: { draft in
-                                    try await store.saveStaff(
+                                    let saved = try await store.saveOwnProfile(
                                         id: currentStaff.id,
                                         name: draft.name,
                                         phone: draft.phone,
-                                        email: draft.email.isEmpty ? nil : draft.email,
-                                        positionName: draft.positionName.isEmpty ? nil : draft.positionName,
-                                        role: draft.role
+                                        email: draft.email.isEmpty ? nil : draft.email
                                     )
+                                    await sessionStore.syncCurrentSession(with: saved)
                                 }
                             )
                         } label: {
                             MoreProfileRow(staff: currentStaff)
                         }
                         .buttonStyle(.plain)
+                        .mariNavigationTapHaptic()
                     }
 
                     VStack(spacing: 0) {
@@ -632,8 +852,9 @@ struct MoreScreen: View {
                                                 store: store,
                                                 staffID: person.id,
                                                 initialStaff: person,
+                                                mode: .management,
                                                 onSave: { draft in
-                                                    try await store.saveStaff(
+                                                    _ = try await store.saveStaff(
                                                         id: person.id,
                                                         name: draft.name,
                                                         phone: draft.phone,
@@ -649,6 +870,7 @@ struct MoreScreen: View {
                                     MoreMenuRow(action: action)
                                 }
                                 .buttonStyle(.plain)
+                                .mariNavigationTapHaptic()
                             } else if action == .privacyPolicy {
                                 NavigationLink {
                                     PrivacyPolicyScreen(
@@ -658,6 +880,7 @@ struct MoreScreen: View {
                                     MoreMenuRow(action: action)
                                 }
                                 .buttonStyle(.plain)
+                                .mariNavigationTapHaptic()
                             } else if action == .settings {
                                 NavigationLink {
                                     SettingsOverviewScreen(store: store)
@@ -665,6 +888,7 @@ struct MoreScreen: View {
                                     MoreMenuRow(action: action)
                                 }
                                 .buttonStyle(.plain)
+                                .mariNavigationTapHaptic()
                             } else if action == .analytics {
                                 NavigationLink {
                                     AnalyticsScreen(sessionStore: sessionStore)
@@ -672,6 +896,7 @@ struct MoreScreen: View {
                                     MoreMenuRow(action: action)
                                 }
                                 .buttonStyle(.plain)
+                                .mariNavigationTapHaptic()
                             } else if action == .onlineBooking {
                                 NavigationLink {
                                     OnlineBookingScreen(sessionStore: sessionStore)
@@ -679,8 +904,10 @@ struct MoreScreen: View {
                                     MoreMenuRow(action: action)
                                 }
                                 .buttonStyle(.plain)
+                                .mariNavigationTapHaptic()
                             } else if action == .support {
                                 Button {
+                                    MariHaptics.navigationTap()
                                     if let url = URL(string: "mailto:support@mari-beauty.local?subject=Mari%20Staff%20Support") {
                                         openURL(url)
                                     }
@@ -726,6 +953,9 @@ struct MoreScreen: View {
             .padding(.bottom, 24)
         }
         .scrollIndicators(.hidden)
+        .mariPullToRefresh {
+            await store.reload()
+        }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
         .task {
@@ -850,17 +1080,23 @@ private struct MoreSubscreenHeader<Trailing: View>: View {
             }
             .buttonStyle(.plain)
 
-            Spacer()
+            Spacer(minLength: 0)
 
             Text(title)
                 .font(.system(size: 24, weight: .black, design: .rounded))
                 .foregroundStyle(MariPalette.ink)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.9)
+                .allowsTightening(true)
+                .multilineTextAlignment(.center)
 
-            Spacer()
+            Spacer(minLength: 0)
 
             trailing
                 .frame(minWidth: 28)
         }
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -925,6 +1161,7 @@ private struct StaffListScreen<Detail: View>: View {
                             )
                         }
                         .buttonStyle(.plain)
+                        .mariNavigationTapHaptic()
                     }
                 }
 
@@ -958,6 +1195,9 @@ private struct StaffListScreen<Detail: View>: View {
         }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
+        .mariPullToRefresh {
+            await store.reload()
+        }
         .task {
             await store.loadStaffDirectoryIfNeeded()
         }
@@ -1092,7 +1332,6 @@ private struct StaffListRow: View {
                     .foregroundStyle(MariPalette.softInk)
 
                 HStack(spacing: 6) {
-                    StaffTag(title: employmentStatusTitle(for: staff), tint: employmentStatusTint(for: staff))
                     if (servicesCount ?? 0) > 0 {
                         StaffTag(title: "Оказывает услуги", tint: Color(hex: 0xF2DC7E))
                     }
@@ -1287,29 +1526,48 @@ private struct StaffDraftValue {
     var positionName: String
     var phone: String
     var email: String
+
+    var normalized: StaffDraftValue {
+        StaffDraftValue(
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+            role: role.trimmingCharacters(in: .whitespacesAndNewlines),
+            positionName: positionName.trimmingCharacters(in: .whitespacesAndNewlines),
+            phone: phone.trimmingCharacters(in: .whitespacesAndNewlines),
+            email: email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        )
+    }
+}
+
+private enum StaffDetailMode {
+    case selfProfile
+    case management
 }
 
 private struct StaffDetailScreen: View {
     @ObservedObject var store: MoreStore
     let staffID: String
     let initialStaff: MariAPIClient.StaffRecord
+    let mode: StaffDetailMode
     let onSave: (StaffDraftValue) async throws -> Void
 
     @State private var draft: StaffDraftValue
     @State private var errorMessage = ""
     @State private var isSavedMessageVisible = false
-    @State private var isDeleteAlertPresented = false
-    @State private var isPhotoAlertPresented = false
+    @State private var isFireAlertPresented = false
+    @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var pendingOnlineBookingVisibility: Bool?
 
     init(
         store: MoreStore,
         staffID: String,
         initialStaff: MariAPIClient.StaffRecord,
+        mode: StaffDetailMode,
         onSave: @escaping (StaffDraftValue) async throws -> Void
     ) {
         self.store = store
         self.staffID = staffID
         self.initialStaff = initialStaff
+        self.mode = mode
         self.onSave = onSave
         _draft = State(
             initialValue: StaffDraftValue(
@@ -1324,6 +1582,10 @@ private struct StaffDetailScreen: View {
 
     private var staff: MariAPIClient.StaffRecord {
         store.staffRecord(id: staffID) ?? initialStaff
+    }
+
+    private var isSelfProfile: Bool {
+        mode == .selfProfile
     }
 
     private var services: [MariAPIClient.StaffServiceRecord] {
@@ -1346,6 +1608,40 @@ private struct StaffDetailScreen: View {
         store.isLoadingPermissions(for: staffID) && !store.hasLoadedPermissions(for: staffID)
     }
 
+    private var isAvatarBusy: Bool {
+        store.isUpdatingAvatar(for: staffID)
+    }
+
+    private var canEditOnlineBooking: Bool {
+        store.canEditOnlineBooking
+    }
+
+    private var canFireStaff: Bool {
+        store.canFireStaff && staff.role != "OWNER" && staff.deletedAt == nil && staff.firedAt == nil
+    }
+
+    private var isOnlineBookingBusy: Bool {
+        store.isUpdatingOnlineBookingVisibility(for: staffID)
+    }
+
+    private var isOnlineBookingLoading: Bool {
+        canEditOnlineBooking && store.clientFrontSpecialist(staffID: staffID) == nil && staff.deletedAt == nil
+    }
+
+    private var onlineBookingVisibility: Bool {
+        pendingOnlineBookingVisibility
+            ?? store.clientFrontSpecialist(staffID: staffID)?.isVisible
+            ?? true
+    }
+
+    private var isOnlineBookingToggleDisabled: Bool {
+        !canEditOnlineBooking || isOnlineBookingBusy || isOnlineBookingLoading || staff.deletedAt != nil || staff.firedAt != nil || !staff.isActive
+    }
+
+    private var normalizedDraft: StaffDraftValue {
+        draft.normalized
+    }
+
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
@@ -1354,57 +1650,130 @@ private struct StaffDetailScreen: View {
                 VStack(spacing: 16) {
                     StaffAvatarView(name: staff.name, avatarURL: staff.avatarUrl, size: 104, iconSize: 40)
 
-                    Button("Изменить фото") {
-                        isPhotoAlertPresented = true
+                    if store.canManageAvatar(for: staffID) {
+                        VStack(spacing: 10) {
+                            PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                                Text(isAvatarBusy ? "Загружаю фото..." : "Изменить фото")
+                                    .font(.headline.weight(.medium))
+                                    .foregroundStyle(MariPalette.softInk)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isAvatarBusy)
+
+                            if staff.avatarUrl != nil {
+                                Button("Удалить фото") {
+                                    Task {
+                                        do {
+                                            try await store.deleteStaffAvatar(staffID: staffID)
+                                            errorMessage = ""
+                                        } catch {
+                                            errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(Color(hex: 0x9A5447))
+                                .disabled(isAvatarBusy)
+                            }
+
+                            if isAvatarBusy {
+                                ProgressView()
+                                    .tint(MariPalette.accent)
+                            }
+                        }
                     }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(MariPalette.softInk)
-                        .font(.headline.weight(.medium))
                 }
                 .padding(.top, 8)
 
-                StaffFormField(title: "Статус") {
-                    Text(employmentStatusTitle(for: staff))
-                        .font(.headline.weight(.medium))
-                        .foregroundStyle(MariPalette.ink)
-                }
-
                 StaffInputField(title: "Имя", text: $draft.name)
-                StaffRoleField(title: "Должность", role: $draft.role)
-                StaffInputField(title: "Специализация", text: $draft.positionName)
+                if isSelfProfile {
+                    StaffReadOnlyField(title: "Специализация", value: draft.positionName)
+                } else {
+                    StaffRoleField(title: "Должность", role: $draft.role)
+                    StaffInputField(title: "Специализация", text: $draft.positionName)
 
-                NavigationLink {
-                    StaffServicesScreen(
-                        store: store,
-                        staffID: staffID,
-                        staffName: staff.name
-                    )
-                } label: {
-                    StaffNavigationCard(
-                        title: "Оказываемые услуги",
-                        subtitle: services.isEmpty ? "Услуги не назначены" : "\(services.count) услуг",
-                        symbol: "scissors",
-                        tint: MariPalette.accentSecondary,
-                        isLoading: isServicesLoading
-                    )
-                }
-                .buttonStyle(.plain)
+                    NavigationLink {
+                        StaffServicesScreen(
+                            store: store,
+                            staffID: staffID,
+                            staffName: staff.name
+                        )
+                    } label: {
+                        StaffNavigationCard(
+                            title: "Оказываемые услуги",
+                            subtitle: services.isEmpty ? "Услуги не назначены" : "\(services.count) услуг",
+                            symbol: "scissors",
+                            tint: MariPalette.accentSecondary,
+                            isLoading: isServicesLoading
+                        )
+                    }
+                    .buttonStyle(.plain)
 
-                NavigationLink {
-                    StaffPermissionsScreen(
-                        store: store,
-                        staffID: staffID
-                    )
-                } label: {
-                    StaffNavigationCard(
-                        title: "Права доступа",
-                        subtitle: permissions.isEmpty ? "Нет выданных прав" : "\(permissions.count) прав",
-                        symbol: "lock.shield",
-                        tint: MariPalette.sky.opacity(0.28),
-                        isLoading: isPermissionsLoading
-                    )
+                    NavigationLink {
+                        StaffPermissionsScreen(
+                            store: store,
+                            staffID: staffID
+                        )
+                    } label: {
+                        StaffNavigationCard(
+                            title: "Права доступа",
+                            subtitle: permissions.isEmpty ? "Нет выданных прав" : "\(permissions.count) прав",
+                            symbol: "lock.shield",
+                            tint: MariPalette.sky.opacity(0.28),
+                            isLoading: isPermissionsLoading
+                        )
+                    }
+                    .buttonStyle(.plain)
+
+                    StaffFormField(title: "Онлайн-запись") {
+                        Toggle(isOn: Binding(
+                            get: { onlineBookingVisibility },
+                            set: { newValue in
+                                pendingOnlineBookingVisibility = newValue
+                                Task {
+                                    do {
+                                        try await store.updateStaffOnlineBookingVisibility(
+                                            staffID: staffID,
+                                            isVisible: newValue
+                                        )
+                                        pendingOnlineBookingVisibility = nil
+                                        errorMessage = ""
+                                    } catch {
+                                        pendingOnlineBookingVisibility = nil
+                                        errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                                    }
+                                }
+                            }
+                        )) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Доступен для онлайн-записи")
+                                    .font(.headline.weight(.bold))
+                                    .foregroundStyle(MariPalette.ink)
+
+                                Text(
+                                    canEditOnlineBooking
+                                        ? "Управляет тем, может ли клиент записаться к сотруднику через клиентский сайт."
+                                        : "Просмотр доступен, изменение требует права `MANAGE_CLIENT_FRONT`."
+                                )
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(MariPalette.softInk)
+
+                                if isOnlineBookingLoading {
+                                    Text("Загружаю текущее состояние...")
+                                        .font(.caption.weight(.bold))
+                                        .foregroundStyle(MariPalette.softInk)
+                                } else if isOnlineBookingBusy {
+                                    Text("Сохраняю и публикую...")
+                                        .font(.caption.weight(.bold))
+                                        .foregroundStyle(MariPalette.softInk)
+                                }
+                            }
+                        }
+                        .tint(MariPalette.accent)
+                        .disabled(isOnlineBookingToggleDisabled)
+                    }
                 }
-                .buttonStyle(.plain)
 
                 StaffInputField(title: "Номер телефона", text: $draft.phone, keyboardType: .phonePad)
                 StaffInputField(title: "Email", text: $draft.email, keyboardType: .emailAddress)
@@ -1417,9 +1786,13 @@ private struct StaffDetailScreen: View {
                 }
 
                 Button {
+                    let nextDraft = normalizedDraft
+                    guard validate(nextDraft) else { return }
+
                     Task {
                         do {
-                            try await onSave(draft)
+                            try await onSave(nextDraft)
+                            draft = nextDraft
                             errorMessage = ""
                             isSavedMessageVisible = true
                         } catch {
@@ -1439,26 +1812,83 @@ private struct StaffDetailScreen: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(isSaving)
+
+                if !isSelfProfile && canFireStaff {
+                    Button(role: .destructive) {
+                        isFireAlertPresented = true
+                    } label: {
+                        Text(isSaving ? "Обрабатываю..." : "Уволить")
+                            .font(.headline.weight(.bold))
+                            .foregroundStyle(Color(hex: 0xA14D4D))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 16)
+                            .background(
+                                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                    .fill(.white.opacity(0.72))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                            .stroke(Color(hex: 0xE7C4C4), lineWidth: 1)
+                                    )
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isSaving)
+                }
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 24)
         }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
+        .mariPullToRefresh {
+            await store.reload()
+            if !isSelfProfile {
+                await store.refreshStaffServices(for: staffID)
+                await store.loadPermissions(for: staffID, force: true)
+                await store.loadClientFrontSpecialistsIfNeeded()
+            }
+        }
         .task {
-            await store.refreshStaffServices(for: staffID)
-            await store.loadPermissions(for: staffID, force: true)
+            if !isSelfProfile {
+                await store.refreshStaffServices(for: staffID)
+                await store.loadPermissions(for: staffID, force: true)
+                await store.loadClientFrontSpecialistsIfNeeded()
+            }
         }
-        .onChange(of: staff.id) { _, _ in syncDraftIfNeeded() }
-        .alert("Удаление на iOS", isPresented: $isDeleteAlertPresented) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("Hard delete сотрудника еще не перенесен в iOS flow.")
+        .onChange(of: staff) { _, _ in syncDraftIfNeeded() }
+        .onChange(of: selectedPhotoItem) { _, newValue in
+            guard let newValue else { return }
+            Task {
+                defer { selectedPhotoItem = nil }
+                do {
+                    guard let rawData = try await newValue.loadTransferable(type: Data.self) else {
+                        throw MariImagePreparationError.unreadableImage
+                    }
+                    let image = try MariImagePreparation.prepareWebPImage(
+                        from: rawData,
+                        suggestedBaseName: staff.id
+                    )
+                    try await store.uploadStaffAvatar(staffID: staffID, image: image)
+                    errorMessage = ""
+                } catch {
+                    errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                }
+            }
         }
-        .alert("Аватар сотрудника", isPresented: $isPhotoAlertPresented) {
-            Button("OK", role: .cancel) {}
+        .alert("Уволить сотрудника?", isPresented: $isFireAlertPresented) {
+            Button("Отмена", role: .cancel) {}
+            Button("Уволить", role: .destructive) {
+                Task {
+                    do {
+                        try await store.fireStaff(staffID: staffID)
+                        errorMessage = ""
+                    } catch {
+                        errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    }
+                }
+            }
         } message: {
-            Text("Загрузка аватара на iOS еще не перенесена.")
+            Text("Будут отменены будущие записи сотрудника, а сам он станет недоступен в системе.")
         }
         .alert("Сохранено", isPresented: $isSavedMessageVisible) {
             Button("OK", role: .cancel) {}
@@ -1475,16 +1905,21 @@ private struct StaffDetailScreen: View {
         )
     }
 
+    private func validate(_ draft: StaffDraftValue) -> Bool {
+        guard !draft.name.isEmpty else {
+            errorMessage = "Имя обязательно"
+            return false
+        }
+        guard !draft.phone.isEmpty else {
+            errorMessage = "Телефон обязателен"
+            return false
+        }
+        return true
+    }
+
     private var header: some View {
-        MoreSubscreenHeader(title: "Сотрудник") {
-            Button {
-                isDeleteAlertPresented = true
-            } label: {
-                Image(systemName: "trash")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(MariPalette.softInk)
-            }
-            .buttonStyle(.plain)
+        MoreSubscreenHeader(title: isSelfProfile ? "Профиль" : "Сотрудник") {
+            Color.clear
         }
     }
 }
@@ -1533,6 +1968,7 @@ private struct StaffInputField: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .keyboardType(keyboardType)
+                .foregroundStyle(MariPalette.ink)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 16)
                 .background(
@@ -1541,6 +1977,34 @@ private struct StaffInputField: View {
                         .background(
                             RoundedRectangle(cornerRadius: 18, style: .continuous)
                                 .fill(.white.opacity(0.64))
+                        )
+                )
+        }
+    }
+}
+
+private struct StaffReadOnlyField: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(MariPalette.softInk)
+
+            Text(value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "—" : value)
+                .font(.headline.weight(.medium))
+                .foregroundStyle(MariPalette.ink)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 16)
+                .background(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(.white.opacity(0.5))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .stroke(Color.black.opacity(0.08), lineWidth: 1)
                         )
                 )
         }
@@ -1779,6 +2243,10 @@ private struct StaffServicesScreen: View {
         }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
+        .mariPullToRefresh {
+            await store.loadServiceCatalogIfNeeded()
+            await store.refreshStaffServices(for: staffID)
+        }
         .task {
             selectedServiceIDs = Set(store.staffServices(for: staffID).map(\.id))
             synchronizeExpandedCategories()
@@ -1957,9 +2425,14 @@ private struct StaffPermissionsScreen: View {
 
     @State private var localErrorMessage = ""
     @State private var pendingPermissionStates: [String: Bool] = [:]
+    @State private var pendingAllNotificationsState: Bool?
 
     private var permissions: [MariAPIClient.StaffPermissionRecord] {
         store.staffPermissions(for: staffID)
+    }
+
+    private var staff: MariAPIClient.StaffRecord? {
+        store.staffRecord(id: staffID)
     }
 
     private var enabledCodes: Set<String> {
@@ -1978,6 +2451,14 @@ private struct StaffPermissionsScreen: View {
         store.isLoadingPermissions(for: staffID) && !store.hasLoadedPermissions(for: staffID)
     }
 
+    private var receivesAllAppointmentNotifications: Bool {
+        pendingAllNotificationsState ?? (staff?.receivesAllAppointmentNotifications ?? false)
+    }
+
+    private var isUpdatingAllAppointmentNotifications: Bool {
+        store.isUpdatingAppointmentNotifications(for: staffID)
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
@@ -1987,6 +2468,51 @@ private struct StaffPermissionsScreen: View {
 
                 if !store.canEditStaffPermissions {
                     StaffEditorNotice(text: "Изменение прав доступа на сервере разрешено только владельцу. Просмотр оставлен доступным.")
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Уведомления о записях")
+                        .font(.caption.weight(.bold))
+                        .tracking(1.2)
+                        .foregroundStyle(MariPalette.softInk)
+
+                    Toggle(isOn: Binding(
+                        get: { receivesAllAppointmentNotifications },
+                        set: { newValue in
+                            pendingAllNotificationsState = newValue
+                            Task { await toggleAllAppointmentNotifications(newValue) }
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Получать все уведомления")
+                                .font(.headline.weight(.bold))
+                                .foregroundStyle(MariPalette.ink)
+                            Text(
+                                staff?.role == "OWNER"
+                                    ? "OWNER получает email по всем записям всегда."
+                                    : "Сотрудник будет получать письма по всем записям салона, не только по своим."
+                            )
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(MariPalette.softInk)
+
+                            if isUpdatingAllAppointmentNotifications {
+                                Text("Сохраняю...")
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(MariPalette.softInk)
+                            }
+                        }
+                    }
+                    .padding(16)
+                    .tint(MariPalette.accent)
+                    .background(
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .fill(.white.opacity(0.64))
+                    )
+                    .disabled(
+                        isUpdatingAllAppointmentNotifications ||
+                        !store.canEditStaffPermissions ||
+                        staff?.role == "OWNER"
+                    )
                 }
 
                 if store.permissionCatalog.isEmpty || isPermissionsLoading {
@@ -2041,6 +2567,10 @@ private struct StaffPermissionsScreen: View {
         }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
+        .mariPullToRefresh {
+            await store.loadPermissionCatalogIfNeeded()
+            await store.loadPermissions(for: staffID, force: true)
+        }
         .task {
             await store.loadPermissionCatalogIfNeeded()
             await store.loadPermissions(for: staffID, force: true)
@@ -2085,6 +2615,20 @@ private struct StaffPermissionsScreen: View {
             localErrorMessage = ""
         } catch {
             pendingPermissionStates[item.code] = nil
+            localErrorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    private func toggleAllAppointmentNotifications(_ enabled: Bool) async {
+        do {
+            try await store.updateStaffAppointmentNotifications(
+                staffID: staffID,
+                receivesAllAppointmentNotifications: enabled
+            )
+            pendingAllNotificationsState = nil
+            localErrorMessage = ""
+        } catch {
+            pendingAllNotificationsState = nil
             localErrorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
@@ -2296,6 +2840,9 @@ private struct SettingsOverviewScreen: View {
         }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
+        .mariPullToRefresh {
+            await store.refreshSettings()
+        }
         .task {
             await store.refreshSettings()
         }
@@ -2364,6 +2911,9 @@ private struct SettingsNotificationsScreen: View {
         }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
+        .mariPullToRefresh {
+            await store.refreshSettings()
+        }
         .task {
             expandSectionsIfNeeded()
             await store.refreshSettings()
@@ -2592,6 +3142,9 @@ private struct PrivacyPolicyScreen: View {
         }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
+        .mariPullToRefresh {
+            await store.refreshPrivacyPolicy()
+        }
         .task {
             draft = store.privacyPolicyText
             await store.refreshPrivacyPolicy()

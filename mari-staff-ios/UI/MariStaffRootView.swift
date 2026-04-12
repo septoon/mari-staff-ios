@@ -6,6 +6,7 @@ struct MariStaffRootView: View {
     @ObservedObject var sessionStore: AppSessionStore
     let onLogout: () -> Void
     @State private var selectedTab: MariStaffTab
+    @State private var suppressNextTabHaptic = false
 
     init(
         snapshot: MariStaffSnapshot,
@@ -84,10 +85,19 @@ struct MariStaffRootView: View {
         .onChange(of: allowedTabs) { _, _ in
             ensureSelectedTabIsAllowed()
         }
+        .onChange(of: selectedTab) { oldValue, newValue in
+            guard oldValue != newValue else { return }
+            if suppressNextTabHaptic {
+                suppressNextTabHaptic = false
+                return
+            }
+            MariHaptics.selectionChanged()
+        }
     }
 
     private func ensureSelectedTabIsAllowed() {
         guard !allowedTabs.contains(selectedTab) else { return }
+        suppressNextTabHaptic = true
         selectedTab = allowedTabs.first ?? .more
     }
 }

@@ -104,6 +104,32 @@ final class AppSessionStore: ObservableObject {
         phase = .unauthenticated
     }
 
+    func syncCurrentSession(with staff: MariAPIClient.StaffRecord) async {
+        guard case let .authenticated(session) = phase else { return }
+        guard session.staff.id == staff.id else { return }
+
+        let updated = StaffSession(
+            staff: .init(
+                id: session.staff.id,
+                name: staff.name,
+                role: staff.role,
+                phoneE164: staff.phoneE164,
+                email: staff.email,
+                permissions: staff.permissions?.map(\.code) ?? session.staff.permissions
+            ),
+            tokens: session.tokens
+        )
+
+        do {
+            try persistSession(updated)
+        } catch {
+            errorMessage = localizedMessage(for: error)
+        }
+
+        await apiClient.hydrate(session: updated)
+        phase = .authenticated(updated)
+    }
+
     private func persistSession(_ session: StaffSession) throws {
         let data = try encoder.encode(session)
         try KeychainStore.save(data: data, service: keychainService, account: keychainAccount)

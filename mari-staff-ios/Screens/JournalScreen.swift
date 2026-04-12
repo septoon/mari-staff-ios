@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import UIKit
 
 private enum JournalFilter: String, CaseIterable, Identifiable {
     case all
@@ -36,6 +37,31 @@ private struct JournalLayout {
     static let timeColumnWidth: CGFloat = 62
     static let staffColumnWidth: CGFloat = 144
     static let hourRowHeight: CGFloat = 76
+}
+
+private let journalCreateStepMinutes = 10
+
+private struct JournalCreateSheetContext: Identifiable {
+    let id = UUID()
+    let selectedDate: Date
+}
+
+private struct JournalCreateDraft {
+    var clientName = ""
+    var clientPhone = ""
+    var appointmentDate: Date
+    var startTime: Date
+    var durationMinutes: Int
+    var staffID = ""
+    var serviceID = ""
+
+    init(selectedDate: Date) {
+        let calendar = makeJournalCalendar()
+        let day = calendar.startOfDay(for: selectedDate)
+        appointmentDate = day
+        startTime = calendar.date(bySettingHour: 10, minute: 0, second: 0, of: day) ?? day
+        durationMinutes = 60
+    }
 }
 
 @MainActor
@@ -169,6 +195,180 @@ private final class JournalAppointmentDetailsStore: ObservableObject {
     }
 }
 
+@MainActor
+private final class JournalCreateStore: ObservableObject {
+    @Published private(set) var staff: [MariAPIClient.StaffRecord] = []
+    @Published private(set) var clients: [MariAPIClient.ClientRecord] = []
+    @Published private(set) var servicesByStaffID: [String: [MariAPIClient.StaffServiceRecord]] = [:]
+    @Published private(set) var isLoading = false
+    @Published private(set) var isSaving = false
+    @Published private(set) var errorMessage = ""
+
+    private let apiClient: MariAPIClient
+    private let session: StaffSession?
+    private var isLoaded = false
+    private var loadingServiceStaffIDs: Set<String> = []
+
+    init(apiClient: MariAPIClient, session: StaffSession?) {
+        self.apiClient = apiClient
+        self.session = session
+    }
+
+    func loadIfNeeded(preferredStaffID: String?) async {
+        guard !isLoaded else {
+            if let preferredStaffID, !preferredStaffID.isEmpty {
+                await ensureServicesLoaded(for: preferredStaffID)
+            }
+            return
+        }
+
+        isLoading = true
+        errorMessage = ""
+        defer { isLoading = false }
+
+        do {
+            let staffRows = try await fetchCreateStaff()
+            staff = staffRows
+            clients = await fetchClients()
+            isLoaded = true
+
+            let trimmedPreferredStaffID = preferredStaffID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let initialStaffID = trimmedPreferredStaffID.isEmpty ? staffRows.first?.id : trimmedPreferredStaffID
+            if let initialStaffID {
+                await ensureServicesLoaded(for: initialStaffID)
+            }
+        } catch {
+            errorMessage = localizedMessage(for: error)
+        }
+    }
+
+    func services(for staffID: String) -> [MariAPIClient.StaffServiceRecord] {
+        servicesByStaffID[staffID] ?? []
+    }
+
+    func ensureServicesLoaded(for staffID: String) async {
+        let trimmedStaffID = staffID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedStaffID.isEmpty else { return }
+        guard servicesByStaffID[trimmedStaffID] == nil else { return }
+        guard !loadingServiceStaffIDs.contains(trimmedStaffID) else { return }
+
+        loadingServiceStaffIDs.insert(trimmedStaffID)
+        defer { loadingServiceStaffIDs.remove(trimmedStaffID) }
+
+        do {
+            let payload = try await apiClient.listStaffServices(id: trimmedStaffID)
+            servicesByStaffID[trimmedStaffID] = payload.items
+                .filter(\.isActive)
+                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        } catch {
+            servicesByStaffID[trimmedStaffID] = []
+            if errorMessage.isEmpty {
+                errorMessage = localizedMessage(for: error)
+            }
+        }
+    }
+
+    func createAppointment(draft: JournalCreateDraft) async throws -> MariAPIClient.AppointmentRecord {
+        let startAt = journalCreateStartDate(for: draft)
+
+        isSaving = true
+        errorMessage = ""
+        defer { isSaving = false }
+
+        do {
+            return try await apiClient.createAppointment(
+                startAt: startAt,
+                staffId: draft.staffID,
+                serviceIDs: [draft.serviceID],
+                clientName: draft.clientName.trimmingCharacters(in: .whitespacesAndNewlines),
+                clientPhone: draft.clientPhone.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        } catch {
+            errorMessage = localizedMessage(for: error)
+            throw error
+        }
+    }
+
+    private func fetchCreateStaff() async throws -> [MariAPIClient.StaffRecord] {
+        var items: [MariAPIClient.StaffRecord] = []
+
+        if let masters = try? await apiClient.listStaff(
+            page: 1,
+            limit: 200,
+            role: "MASTER",
+            isActive: true,
+            employmentStatus: "current"
+        ) {
+            items = masters.items
+        }
+
+        if items.isEmpty, let fallback = try? await apiClient.listStaff(
+            page: 1,
+            limit: 200,
+            role: nil,
+            isActive: true,
+            employmentStatus: "current"
+        ) {
+            items = fallback.items
+        }
+
+        items = items
+            .filter { $0.deletedAt == nil && $0.firedAt == nil && $0.isActive }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+        if let session = session?.staff, !items.contains(where: { $0.id == session.id }) {
+            items.insert(makeCurrentStaffRecord(from: session), at: 0)
+        }
+
+        if items.isEmpty, let session = session?.staff {
+            items = [makeCurrentStaffRecord(from: session)]
+        }
+
+        if items.isEmpty {
+            throw MariAPIClient.APIClientError.invalidResponse
+        }
+
+        return items
+    }
+
+    private func fetchClients() async -> [MariAPIClient.ClientRecord] {
+        guard let payload = try? await apiClient.listClients(page: 1, limit: 200) else {
+            return []
+        }
+
+        return payload.items.sorted {
+            ($0.name ?? "").localizedCaseInsensitiveCompare($1.name ?? "") == .orderedAscending
+        }
+    }
+
+    private func makeCurrentStaffRecord(from session: StaffSession.StaffIdentity) -> MariAPIClient.StaffRecord {
+        MariAPIClient.StaffRecord(
+            id: session.id,
+            name: session.name,
+            role: session.role,
+            phoneE164: session.phoneE164,
+            email: session.email,
+            receivesAllAppointmentNotifications: session.role == "OWNER",
+            avatarUrl: nil,
+            isActive: true,
+            position: nil,
+            hiredAt: nil,
+            firedAt: nil,
+            deletedAt: nil,
+            permissions: session.permissions?.map {
+                MariAPIClient.StaffRecord.PermissionSnapshot(code: $0, expiresAt: nil)
+            }
+        )
+    }
+
+    private func localizedMessage(for error: Error) -> String {
+        if let localized = error as? LocalizedError, let description = localized.errorDescription {
+            return description
+        }
+        return error.localizedDescription
+    }
+}
+
 struct JournalScreen: View {
     let sessionStore: AppSessionStore
 
@@ -177,6 +377,7 @@ struct JournalScreen: View {
     @State private var selectedDate: Date
     @State private var isDatePickerPresented = false
     @State private var selectedAppointment: MariAPIClient.AppointmentRecord?
+    @State private var createSheetContext: JournalCreateSheetContext?
 
     init(sessionStore: AppSessionStore) {
         self.sessionStore = sessionStore
@@ -254,7 +455,7 @@ struct JournalScreen: View {
     }
 
     private var timelineWidth: CGFloat {
-        JournalLayout.timeColumnWidth + CGFloat(max(visibleStaff.count, 1)) * JournalLayout.staffColumnWidth
+        CGFloat(max(visibleStaff.count, 1)) * JournalLayout.staffColumnWidth
     }
 
     private var isInitialLoading: Bool {
@@ -263,6 +464,14 @@ struct JournalScreen: View {
 
     private var canViewClientPhone: Bool {
         mariHasPermissionAccess(sessionStore.currentSession, permissionCode: "VIEW_CLIENT_PHONE")
+    }
+
+    private var canCreateJournalAppointments: Bool {
+        mariHasPermissionAccess(sessionStore.currentSession, permissionCode: "CREATE_JOURNAL_APPOINTMENTS")
+    }
+
+    private var timelineHeight: CGFloat {
+        CGFloat(max(hours.count - 1, 0)) * JournalLayout.hourRowHeight
     }
 
     var body: some View {
@@ -287,6 +496,9 @@ struct JournalScreen: View {
                     .padding(.bottom, 132)
                 }
                 .scrollIndicators(.hidden)
+                .mariPullToRefresh {
+                    await store.reload(around: selectedDate)
+                }
             }
 
             VStack(alignment: .trailing, spacing: 12) {
@@ -323,6 +535,24 @@ struct JournalScreen: View {
                 canViewClientPhone: canViewClientPhone
             ) { nextAppointment in
                 selectedAppointment = nextAppointment
+            }
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationCornerRadius(28)
+        }
+        .sheet(item: $createSheetContext) { context in
+            JournalCreateSheet(
+                apiClient: sessionStore.api,
+                session: sessionStore.currentSession,
+                selectedDate: context.selectedDate,
+                preferredStaffID: store.currentStaffID
+            ) { appointment in
+                let nextDate = calendar.startOfDay(for: appointment.startAt)
+                selectedDate = nextDate
+                selectedAppointment = appointment
+                Task {
+                    await store.reload(around: nextDate)
+                }
             }
             .presentationDetents([.large])
             .presentationDragIndicator(.visible)
@@ -401,48 +631,49 @@ struct JournalScreen: View {
     }
 
     private var timeline: some View {
-        ScrollView(.horizontal) {
-            VStack(spacing: 0) {
-                if !visibleStaff.isEmpty {
+        HStack(alignment: .top, spacing: 0) {
+            pinnedTimeColumn
+
+            ScrollView(.horizontal) {
+                VStack(spacing: 0) {
                     staffHeaderRow
-                }
 
-                ZStack(alignment: .topLeading) {
-                    timelineGrid
+                    ZStack(alignment: .topLeading) {
+                        timelineGrid
 
-                    ForEach(filteredAppointments) { appointment in
-                        JournalAppointmentCard(
-                            appointment: appointment,
-                            x: xOffset(forStaffID: appointment.staff.id),
-                            top: yPosition(for: appointment.startAt),
-                            width: JournalLayout.staffColumnWidth,
-                            height: appointmentHeight(for: appointment),
-                            action: {
-                                selectedAppointment = appointment
-                            }
-                        )
+                        ForEach(filteredAppointments) { appointment in
+                            JournalAppointmentCard(
+                                appointment: appointment,
+                                x: xOffset(forStaffID: appointment.staff.id),
+                                top: yPosition(for: appointment.startAt),
+                                width: JournalLayout.staffColumnWidth,
+                                height: appointmentHeight(for: appointment),
+                                action: {
+                                    selectedAppointment = appointment
+                                }
+                            )
+                        }
                     }
-
+                    .frame(width: timelineWidth, height: timelineHeight)
                 }
-                .frame(
-                    width: timelineWidth,
-                    height: CGFloat(hours.count - 1) * JournalLayout.hourRowHeight
-                )
             }
+            .scrollIndicators(.hidden)
         }
-        .scrollIndicators(.hidden)
+        .padding(.leading, 16)
     }
 
     private var staffHeaderRow: some View {
         HStack(spacing: 0) {
-            Button {
-            } label: {
-                Image(systemName: "plus")
-                    .font(.system(size: 26, weight: .light))
-                    .foregroundStyle(MariPalette.accent)
-                    .frame(width: JournalLayout.timeColumnWidth, height: 74)
+            if visibleStaff.isEmpty {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(.white.opacity(0.42))
+                    .overlay {
+                        Text("Нет записей")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(MariPalette.softInk)
+                    }
+                    .frame(width: JournalLayout.staffColumnWidth, height: 74)
             }
-            .buttonStyle(.plain)
 
             ForEach(visibleStaff, id: \.id) { staff in
                 JournalStaffColumnHeader(
@@ -455,8 +686,10 @@ struct JournalScreen: View {
         .padding(.top, 4)
     }
 
-    private var timelineGrid: some View {
-        HStack(spacing: 0) {
+    private var pinnedTimeColumn: some View {
+        VStack(spacing: 0) {
+            createButtonCell
+
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(hours.dropLast()), id: \.self) { hour in
                     Text(hourLabel(hour))
@@ -465,28 +698,89 @@ struct JournalScreen: View {
                         .frame(width: JournalLayout.timeColumnWidth, height: JournalLayout.hourRowHeight, alignment: .topLeading)
                 }
             }
+        }
+    }
 
-            HStack(spacing: 0) {
-                ForEach(0..<max(visibleStaff.count, 1), id: \.self) { _ in
-                    VStack(spacing: 0) {
-                        ForEach(Array(hours.dropLast()), id: \.self) { _ in
-                            Rectangle()
-                                .fill(.clear)
-                                .frame(height: JournalLayout.hourRowHeight)
-                                .overlay(alignment: .top) {
-                                    Rectangle()
-                                        .fill(Color.black.opacity(0.08))
-                                        .frame(height: 1)
-                                }
-                        }
-                    }
-                    .frame(width: JournalLayout.staffColumnWidth)
+    private var createButtonCell: some View {
+        Group {
+            if canCreateJournalAppointments {
+                Button {
+                    MariHaptics.navigationTap()
+                    createSheetContext = JournalCreateSheetContext(selectedDate: selectedDate)
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 26, weight: .light))
+                        .foregroundStyle(MariPalette.accent)
+                        .frame(width: JournalLayout.timeColumnWidth, height: 74)
                 }
+                .buttonStyle(.plain)
+            } else {
+                Color.clear
+                    .frame(width: JournalLayout.timeColumnWidth, height: 74)
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private var timelineGrid: some View {
+        HStack(spacing: 0) {
+            ForEach(0..<max(visibleStaff.count, 1), id: \.self) { _ in
+                VStack(spacing: 0) {
+                    ForEach(Array(hours.dropLast()), id: \.self) { _ in
+                        Rectangle()
+                            .fill(.clear)
+                            .frame(height: JournalLayout.hourRowHeight)
+                            .overlay(alignment: .top) {
+                                Rectangle()
+                                    .fill(Color.black.opacity(0.08))
+                                    .frame(height: 1)
+                            }
+                    }
+                }
+                .frame(width: JournalLayout.staffColumnWidth)
             }
         }
     }
 
-    private var todayButton: some View {
+    private var selectedDateLabel: String {
+        let formatter = DateFormatter()
+        formatter.locale = MariLocale.ru
+        formatter.setLocalizedDateFormatFromTemplate("d MMMM")
+        return formatter.string(from: selectedDate).lowercased()
+    }
+
+    private func hourLabel(_ hour: Int) -> String {
+        String(format: "%02d:00", hour)
+    }
+
+    private func shortWeekday(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = MariLocale.ru
+        formatter.setLocalizedDateFormatFromTemplate("EEE")
+        return formatter.string(from: date).lowercased()
+    }
+
+    private func xOffset(forStaffID staffID: String) -> CGFloat {
+        guard let index = visibleStaff.firstIndex(where: { $0.id == staffID }) else {
+            return 0
+        }
+        return CGFloat(index) * JournalLayout.staffColumnWidth
+    }
+
+    private func yPosition(for date: Date) -> CGFloat {
+        let hour = calendar.component(.hour, from: date)
+        let minute = calendar.component(.minute, from: date)
+        let hourDelta = CGFloat(hour - gridStartHour)
+        return (hourDelta + CGFloat(minute) / 60) * JournalLayout.hourRowHeight
+    }
+
+    private func appointmentHeight(for appointment: MariAPIClient.AppointmentRecord) -> CGFloat {
+        max(CGFloat(appointment.endAt.timeIntervalSince(appointment.startAt) / 3600) * JournalLayout.hourRowHeight - 4, 52)
+    }
+}
+
+private extension JournalScreen {
+    var todayButton: some View {
         Button {
             withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
                 selectedDate = calendar.startOfDay(for: .now)
@@ -516,7 +810,7 @@ struct JournalScreen: View {
         .buttonStyle(.plain)
     }
 
-    private var weekSwitcher: some View {
+    var weekSwitcher: some View {
         HStack(spacing: 4) {
             ForEach(weekDays, id: \.self) { day in
                 let isSelected = calendar.isDate(day, inSameDayAs: selectedDate)
@@ -557,42 +851,6 @@ struct JournalScreen: View {
                 .stroke(.white.opacity(0.08), lineWidth: 1)
         )
     }
-
-    private var selectedDateLabel: String {
-        let formatter = DateFormatter()
-        formatter.locale = MariLocale.ru
-        formatter.setLocalizedDateFormatFromTemplate("d MMMM")
-        return formatter.string(from: selectedDate).lowercased()
-    }
-
-    private func hourLabel(_ hour: Int) -> String {
-        String(format: "%02d:00", hour)
-    }
-
-    private func shortWeekday(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = MariLocale.ru
-        formatter.setLocalizedDateFormatFromTemplate("EEE")
-        return formatter.string(from: date).lowercased()
-    }
-
-    private func xOffset(forStaffID staffID: String) -> CGFloat {
-        guard let index = visibleStaff.firstIndex(where: { $0.id == staffID }) else {
-            return JournalLayout.timeColumnWidth
-        }
-        return JournalLayout.timeColumnWidth + CGFloat(index) * JournalLayout.staffColumnWidth
-    }
-
-    private func yPosition(for date: Date) -> CGFloat {
-        let hour = calendar.component(.hour, from: date)
-        let minute = calendar.component(.minute, from: date)
-        let hourDelta = CGFloat(hour - gridStartHour)
-        return (hourDelta + CGFloat(minute) / 60) * JournalLayout.hourRowHeight
-    }
-
-    private func appointmentHeight(for appointment: MariAPIClient.AppointmentRecord) -> CGFloat {
-        max(CGFloat(appointment.endAt.timeIntervalSince(appointment.startAt) / 3600) * JournalLayout.hourRowHeight - 4, 52)
-    }
 }
 
 private struct JournalStaffColumnHeader: View {
@@ -615,6 +873,611 @@ private struct JournalStaffColumnHeader: View {
                 .foregroundStyle(MariPalette.softInk)
                 .lineLimit(1)
         }
+    }
+}
+
+private struct JournalCreateSheet: View {
+    let apiClient: MariAPIClient
+    let session: StaffSession?
+    let selectedDate: Date
+    let preferredStaffID: String?
+    let onCreated: (MariAPIClient.AppointmentRecord) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var store: JournalCreateStore
+    @State private var draft: JournalCreateDraft
+    @State private var localErrorMessage = ""
+
+    init(
+        apiClient: MariAPIClient,
+        session: StaffSession?,
+        selectedDate: Date,
+        preferredStaffID: String?,
+        onCreated: @escaping (MariAPIClient.AppointmentRecord) -> Void
+    ) {
+        self.apiClient = apiClient
+        self.session = session
+        self.selectedDate = selectedDate
+        self.preferredStaffID = preferredStaffID
+        self.onCreated = onCreated
+        _store = StateObject(wrappedValue: JournalCreateStore(apiClient: apiClient, session: session))
+        _draft = State(initialValue: JournalCreateDraft(selectedDate: selectedDate))
+    }
+
+    private var availableServices: [MariAPIClient.StaffServiceRecord] {
+        store.services(for: draft.staffID)
+    }
+
+    private var selectedStaff: MariAPIClient.StaffRecord? {
+        store.staff.first(where: { $0.id == draft.staffID })
+    }
+
+    private var selectedService: MariAPIClient.StaffServiceRecord? {
+        availableServices.first(where: { $0.id == draft.serviceID })
+    }
+
+    private var startAt: Date {
+        journalCreateStartDate(for: draft)
+    }
+
+    private var endAt: Date {
+        Calendar.current.date(byAdding: .minute, value: draft.durationMinutes, to: startAt) ?? startAt
+    }
+
+    private var isServicesLoading: Bool {
+        !draft.staffID.isEmpty && store.servicesByStaffID[draft.staffID] == nil
+    }
+
+    private var durationOptions: [Int] {
+        let presets = [30, 45, 60, 90, 120, 150, 180]
+        let current = max(15, draft.durationMinutes)
+        return (presets.contains(current) ? presets : (presets + [current])).sorted()
+    }
+
+    private var clientSuggestions: [MariAPIClient.ClientRecord] {
+        let query = draft.clientName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return [] }
+
+        return store.clients
+            .filter { ($0.name ?? "").lowercased().contains(query) }
+            .sorted {
+                let lhs = ($0.name ?? "").lowercased()
+                let rhs = ($1.name ?? "").lowercased()
+                let lhsStarts = lhs.hasPrefix(query)
+                let rhsStarts = rhs.hasPrefix(query)
+                if lhsStarts != rhsStarts {
+                    return lhsStarts
+                }
+                return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+            }
+            .prefix(5)
+            .map { $0 }
+    }
+
+    private var createDisabledReason: String? {
+        if isServicesLoading {
+            return "Пока загружаются услуги выбранного сотрудника."
+        }
+        if draft.staffID.isEmpty {
+            return "Нет доступных сотрудников для записи."
+        }
+        if availableServices.isEmpty {
+            return "У выбранного сотрудника нет назначенных услуг."
+        }
+        return nil
+    }
+
+    private var errorMessage: String {
+        localErrorMessage.isEmpty ? store.errorMessage : localErrorMessage
+    }
+
+    var body: some View {
+        ZStack {
+            MariBackground()
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    header
+
+                    if !errorMessage.isEmpty {
+                        JournalCreateStatusCard(message: errorMessage, tint: Color(hex: 0xF3D0CA))
+                    }
+
+                    contactSection
+                    sessionSection
+                    serviceSection
+                    footer
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 24)
+            }
+            .scrollIndicators(.hidden)
+        }
+        .task {
+            await store.loadIfNeeded(preferredStaffID: preferredStaffID)
+            await prepareInitialDraft()
+        }
+        .task(id: draft.staffID) {
+            await syncServicesForSelectedStaff()
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Журнал")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(MariPalette.softInk.opacity(0.9))
+                .textCase(.uppercase)
+
+            Text("Новая запись")
+                .font(.system(size: 34, weight: .black, design: .rounded))
+                .foregroundStyle(MariPalette.ink)
+        }
+    }
+
+    private var contactSection: some View {
+        JournalCreateSectionCard(
+            eyebrow: "Клиент",
+            title: "Контакт для записи",
+            description: "Минимальный набор для создания: имя и телефон. Остальное можно дополнить позже из карточки визита."
+        ) {
+            VStack(spacing: 14) {
+                VStack(spacing: 10) {
+                    JournalCreateTextField(
+                        title: "Имя клиента",
+                        placeholder: "Например, Анжелика",
+                        text: $draft.clientName
+                    )
+
+                    if !clientSuggestions.isEmpty {
+                        VStack(spacing: 8) {
+                            ForEach(clientSuggestions) { client in
+                                Button {
+                                    draft.clientName = client.name ?? draft.clientName
+                                    draft.clientPhone = client.phoneE164
+                                } label: {
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(client.name ?? "Без имени")
+                                                .font(.subheadline.weight(.bold))
+                                                .foregroundStyle(MariPalette.ink)
+
+                                            Text(client.phoneE164)
+                                                .font(.footnote.weight(.medium))
+                                                .foregroundStyle(MariPalette.softInk)
+                                        }
+
+                                        Spacer(minLength: 12)
+                                    }
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 12)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                            .fill(.white)
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+
+                JournalCreateTextField(
+                    title: "Телефон",
+                    placeholder: "+7 978 000 00 00",
+                    text: $draft.clientPhone,
+                    keyboardType: .phonePad
+                )
+            }
+        }
+    }
+
+    private var sessionSection: some View {
+        JournalCreateSectionCard(
+            eyebrow: "Сеанс",
+            title: "Дата, время и исполнитель",
+            description: "Дата по умолчанию берётся из текущего дня журнала. При необходимости её можно поменять прямо здесь."
+        ) {
+            VStack(spacing: 14) {
+                JournalCreateFieldShell(title: "Дата записи") {
+                    DatePicker(
+                        "",
+                        selection: $draft.appointmentDate,
+                        displayedComponents: .date
+                    )
+                    .labelsHidden()
+                    .environment(\.locale, MariLocale.ru)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .tint(MariPalette.ink)
+                }
+
+                JournalCreateFieldShell(title: "Начало") {
+                    DatePicker(
+                        "",
+                        selection: $draft.startTime,
+                        displayedComponents: .hourAndMinute
+                    )
+                    .labelsHidden()
+                    .environment(\.locale, MariLocale.ru)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .tint(MariPalette.ink)
+                }
+
+                JournalCreateFieldShell(title: "Сотрудник") {
+                    Picker("", selection: $draft.staffID) {
+                        ForEach(store.staff, id: \.id) { staff in
+                            Text(staff.name).tag(staff.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .tint(MariPalette.ink)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                JournalCreateFieldShell(title: "Длительность") {
+                    Picker("", selection: $draft.durationMinutes) {
+                        ForEach(durationOptions, id: \.self) { minutes in
+                            Text("\(minutes) мин").tag(minutes)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .tint(MariPalette.ink)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    private var serviceSection: some View {
+        JournalCreateSectionCard(
+            eyebrow: "Услуга",
+            title: "Что именно записываем",
+            description: "Список пока общий. Если понадобится, следующим этапом можно ограничить услуги выбранным мастером."
+        ) {
+            VStack(spacing: 14) {
+                if isServicesLoading {
+                    JournalCreateStatusCard(message: "Загружаю услуги сотрудника...", tint: Color(hex: 0xEEF2F8))
+                } else if availableServices.isEmpty {
+                    JournalCreateStatusCard(message: "Для этого сотрудника услуги не назначены.", tint: Color(hex: 0xEEF2F8))
+                } else {
+                    JournalCreateFieldShell(title: "Услуга") {
+                        Picker("", selection: $draft.serviceID) {
+                            ForEach(availableServices, id: \.id) { service in
+                                Text(service.name).tag(service.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .tint(MariPalette.ink)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .onChange(of: draft.serviceID) { _, newValue in
+                        guard let service = availableServices.first(where: { $0.id == newValue }) else { return }
+                        draft.durationMinutes = max(15, Int(round(Double(service.durationSec) / 60)))
+                    }
+                }
+
+                JournalCreatePreviewCard(
+                    startAt: startAt,
+                    endAt: endAt,
+                    staffName: selectedStaff?.name ?? "Сотрудник не выбран",
+                    serviceName: selectedService?.name ?? "Услуга не выбрана",
+                    durationMinutes: draft.durationMinutes,
+                    priceMax: selectedService?.priceMax
+                )
+            }
+        }
+    }
+
+    private var footer: some View {
+        VStack(spacing: 10) {
+            Button {
+                save()
+            } label: {
+                HStack(spacing: 8) {
+                    if store.isSaving {
+                        ProgressView()
+                            .tint(MariPalette.ink)
+                    } else {
+                        Image(systemName: "plus")
+                            .font(.subheadline.weight(.bold))
+                    }
+
+                    Text(store.isSaving ? "Создаю запись..." : "Создать запись")
+                        .font(.headline.weight(.bold))
+                }
+                .foregroundStyle(MariPalette.ink)
+                .frame(maxWidth: .infinity)
+                .frame(height: 54)
+                .background(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(createDisabledReason == nil ? MariPalette.accent : Color(hex: 0xE5E9F0))
+                )
+            }
+            .buttonStyle(.plain)
+            .disabled(store.isSaving || createDisabledReason != nil)
+
+            if let createDisabledReason {
+                Text(createDisabledReason)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(MariPalette.softInk)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 4)
+    }
+
+    private func prepareInitialDraft() async {
+        guard draft.staffID.isEmpty else { return }
+
+        let trimmedPreferredStaffID = preferredStaffID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let initialStaffID = trimmedPreferredStaffID.isEmpty ? (store.staff.first?.id ?? "") : trimmedPreferredStaffID
+        guard !initialStaffID.isEmpty else { return }
+
+        draft.staffID = initialStaffID
+    }
+
+    private func syncServicesForSelectedStaff() async {
+        guard !draft.staffID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        await store.ensureServicesLoaded(for: draft.staffID)
+        let services = availableServices
+
+        if services.isEmpty {
+            draft.serviceID = ""
+            return
+        }
+
+        guard services.contains(where: { $0.id == draft.serviceID }) else {
+            let first = services[0]
+            draft.serviceID = first.id
+            draft.durationMinutes = max(15, Int(round(Double(first.durationSec) / 60)))
+            return
+        }
+    }
+
+    private func save() {
+        localErrorMessage = ""
+
+        let trimmedName = draft.clientName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPhone = draft.clientPhone.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedName.isEmpty else {
+            localErrorMessage = "Укажите имя клиента."
+            return
+        }
+
+        guard !trimmedPhone.isEmpty else {
+            localErrorMessage = "Укажите телефон клиента."
+            return
+        }
+
+        guard !draft.staffID.isEmpty, !draft.serviceID.isEmpty else {
+            localErrorMessage = "Не выбраны сотрудник или услуга."
+            return
+        }
+
+        guard journalCreateIsStartAligned(draft.startTime) else {
+            localErrorMessage = "Время записи должно быть кратно \(journalCreateStepMinutes) минутам."
+            return
+        }
+
+        Task {
+            do {
+                let created = try await store.createAppointment(draft: draft)
+                onCreated(created)
+                dismiss()
+            } catch {
+                localErrorMessage = store.errorMessage.isEmpty
+                    ? ((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                    : store.errorMessage
+            }
+        }
+    }
+}
+
+private struct JournalCreateSectionCard<Content: View>: View {
+    let eyebrow: String
+    let title: String
+    let description: String
+
+    private let content: Content
+
+    init(
+        eyebrow: String,
+        title: String,
+        description: String,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.eyebrow = eyebrow
+        self.title = title
+        self.description = description
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(eyebrow)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(MariPalette.softInk.opacity(0.75))
+                    .textCase(.uppercase)
+
+                Text(title)
+                    .font(.system(size: 28, weight: .black, design: .rounded))
+                    .foregroundStyle(MariPalette.ink)
+
+                Text(description)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(MariPalette.softInk.opacity(0.88))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            content
+        }
+        .padding(20)
+        .background(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(Color.white.opacity(0.94))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .stroke(.black.opacity(0.05), lineWidth: 1)
+                )
+        )
+        .shadow(color: .black.opacity(0.06), radius: 18, x: 0, y: 10)
+    }
+}
+
+private struct JournalCreateFieldShell<Content: View>: View {
+    let title: String
+
+    private let content: Content
+
+    init(title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(MariPalette.softInk.opacity(0.75))
+                .textCase(.uppercase)
+
+            content
+                .padding(.horizontal, 14)
+                .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(Color.white)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .stroke(Color.black.opacity(0.08), lineWidth: 1)
+                        )
+                )
+        }
+    }
+}
+
+private struct JournalCreateTextField: View {
+    let title: String
+    let placeholder: String
+    @Binding var text: String
+    var keyboardType: UIKeyboardType = .default
+
+    var body: some View {
+        JournalCreateFieldShell(title: title) {
+            TextField(placeholder, text: $text)
+                .textInputAutocapitalization(keyboardType == .phonePad ? .never : .words)
+                .keyboardType(keyboardType)
+                .foregroundStyle(MariPalette.ink)
+        }
+    }
+}
+
+private struct JournalCreateStatusCard: View {
+    let message: String
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "info.circle.fill")
+                .foregroundStyle(MariPalette.softInk)
+
+            Text(message)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(MariPalette.softInk)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(tint)
+        )
+    }
+}
+
+private struct JournalCreatePreviewCard: View {
+    let startAt: Date
+    let endAt: Date
+    let staffName: String
+    let serviceName: String
+    let durationMinutes: Int
+    let priceMax: Double?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Предпросмотр")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(MariPalette.softInk.opacity(0.75))
+                .textCase(.uppercase)
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "calendar")
+                        .foregroundStyle(MariPalette.softInk)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(startAt.formatted(.dateTime.day().month().year().locale(MariLocale.ru)))
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(MariPalette.ink)
+                        Text("\(startAt.formatted(date: .omitted, time: .shortened))-\(endAt.formatted(date: .omitted, time: .shortened))")
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(MariPalette.softInk)
+                    }
+                }
+
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "person")
+                        .foregroundStyle(MariPalette.softInk)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(staffName)
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(MariPalette.ink)
+                        Text(serviceName)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(MariPalette.softInk)
+                    }
+                }
+
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "clock")
+                        .foregroundStyle(MariPalette.softInk)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(durationMinutes) мин")
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(MariPalette.ink)
+                        Text(previewPrice)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(MariPalette.softInk)
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color(hex: 0xF8FAFC))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(Color.black.opacity(0.05), lineWidth: 1)
+                )
+        )
+    }
+
+    private var previewPrice: String {
+        guard let priceMax, priceMax > 0 else {
+            return "Стоимость можно уточнить позже"
+        }
+        return "До \(MariFormatters.money(Int(priceMax.rounded())))"
     }
 }
 
@@ -1602,6 +2465,26 @@ private func journalTelegramURL(for phone: String) -> URL? {
     let digits = phone.filter(\.isNumber)
     guard !digits.isEmpty else { return nil }
     return URL(string: "tg://resolve?phone=\(digits)")
+}
+
+private func journalCreateStartDate(for draft: JournalCreateDraft) -> Date {
+    let calendar = makeJournalCalendar()
+    let dateComponents = calendar.dateComponents([.year, .month, .day], from: draft.appointmentDate)
+    let timeComponents = calendar.dateComponents([.hour, .minute], from: draft.startTime)
+    var components = DateComponents()
+    components.year = dateComponents.year
+    components.month = dateComponents.month
+    components.day = dateComponents.day
+    components.hour = timeComponents.hour
+    components.minute = timeComponents.minute
+    components.second = 0
+    return calendar.date(from: components) ?? draft.appointmentDate
+}
+
+private func journalCreateIsStartAligned(_ date: Date) -> Bool {
+    let calendar = makeJournalCalendar()
+    let minute = calendar.component(.minute, from: date)
+    return minute % journalCreateStepMinutes == 0
 }
 
 #Preview {

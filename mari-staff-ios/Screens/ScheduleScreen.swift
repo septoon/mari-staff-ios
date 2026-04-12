@@ -9,10 +9,11 @@ private struct ScheduleMonthTab: Identifiable, Hashable {
 }
 
 private struct ScheduleGridLayout {
-    static let staffColumnWidth: CGFloat = 82
+    static let staffColumnWidth: CGFloat = 68
     static let dayColumnWidth: CGFloat = 46
     static let rowHeight: CGFloat = 64
     static let gap: CGFloat = 8
+    static let headerHeight: CGFloat = 40
 }
 
 @MainActor
@@ -78,8 +79,15 @@ private final class ScheduleStore: ObservableObject {
                 return result
             }
 
-            staff = staffRows
-            scheduleByStaff = grouped
+            let visibleStaffRows = staffRows.filter { person in
+                guard let dates = grouped[person.id] else { return false }
+                return dates.values.contains { !$0.isEmpty }
+            }
+
+            staff = visibleStaffRows
+            scheduleByStaff = grouped.filter { staffID, dates in
+                visibleStaffRows.contains(where: { $0.id == staffID }) && dates.values.contains { !$0.isEmpty }
+            }
             loadedMonthKey = key
         } catch {
             if staff.isEmpty {
@@ -123,6 +131,7 @@ private final class ScheduleStore: ObservableObject {
                 role: session.role,
                 phoneE164: session.phoneE164,
                 email: session.email,
+                receivesAllAppointmentNotifications: session.role == "OWNER",
                 avatarUrl: nil,
                 isActive: true,
                 position: nil,
@@ -154,11 +163,17 @@ struct ScheduleScreen: View {
     @State private var selectedDate: Date
     @State private var isDatePickerPresented = false
     @State private var isEditAlertPresented = false
+    @State private var monthScrollerID: String?
+    @State private var monthTabsInitialized = false
+    @State private var dayScrollerID: String?
+    @State private var selectedStaffID: String?
 
     init(sessionStore: AppSessionStore) {
         self.sessionStore = sessionStore
         let initialDate = makeScheduleCalendar().startOfDay(for: .now)
         _selectedDate = State(initialValue: initialDate)
+        _monthScrollerID = State(initialValue: scheduleMonthKey(initialDate))
+        _dayScrollerID = State(initialValue: scheduleISODate(initialDate))
         _store = StateObject(
             wrappedValue: ScheduleStore(
                 apiClient: sessionStore.api,
@@ -171,14 +186,20 @@ struct ScheduleScreen: View {
         makeScheduleCalendar()
     }
 
-    private var weekDates: [Date] {
-        let start = calendar.dateInterval(of: .weekOfYear, for: selectedDate)?.start
-            ?? calendar.startOfDay(for: selectedDate)
-        return (0..<7).compactMap { calendar.date(byAdding: .day, value: $0, to: start) }
+    private var today: Date {
+        calendar.startOfDay(for: .now)
+    }
+
+    private var monthDates: [Date] {
+        let monthStart = scheduleMonthStart(selectedDate)
+        let daysCount = calendar.range(of: .day, in: .month, for: monthStart)?.count ?? 0
+        return (0..<daysCount).compactMap { offset in
+            calendar.date(byAdding: .day, value: offset, to: monthStart)
+        }
     }
 
     private var monthTabs: [ScheduleMonthTab] {
-        (0..<5).compactMap { offset in
+        (-5...5).compactMap { offset in
             guard let date = calendar.date(byAdding: .month, value: offset, to: scheduleMonthStart(selectedDate)) else {
                 return nil
             }
@@ -187,7 +208,16 @@ struct ScheduleScreen: View {
     }
 
     private var visibleStaff: [MariAPIClient.StaffRecord] {
-        store.staff
+        guard let selectedStaffID else { return store.staff }
+        return store.staff.filter { $0.id == selectedStaffID }
+    }
+
+    private var selectedStaffTitle: String {
+        guard let selectedStaffID,
+              let staff = store.staff.first(where: { $0.id == selectedStaffID }) else {
+            return "Все"
+        }
+        return firstName(staff.name)
     }
 
     private var markedDates: Set<String> {
@@ -197,10 +227,10 @@ struct ScheduleScreen: View {
         )
     }
 
-    private var gridWidth: CGFloat {
-        ScheduleGridLayout.staffColumnWidth
-        + CGFloat(weekDates.count) * ScheduleGridLayout.dayColumnWidth
-        + CGFloat(weekDates.count - 1) * ScheduleGridLayout.gap
+    private var dayGridWidth: CGFloat {
+        let dayCount = monthDates.count
+        return CGFloat(dayCount) * ScheduleGridLayout.dayColumnWidth
+        + CGFloat(max(dayCount - 1, 0)) * ScheduleGridLayout.gap
     }
 
     private var isInitialLoading: Bool {
@@ -217,7 +247,7 @@ struct ScheduleScreen: View {
                     header
 
                     if isInitialLoading {
-                        ScheduleInitialSkeleton(gridWidth: gridWidth)
+                        ScheduleInitialSkeleton(dayGridWidth: dayGridWidth)
                     } else {
                         weekGrid
 
@@ -235,6 +265,9 @@ struct ScheduleScreen: View {
                 .padding(.bottom, 18)
             }
             .scrollIndicators(.hidden)
+            .mariPullToRefresh {
+                await store.reload(for: selectedDate)
+            }
         }
         .safeAreaInset(edge: .bottom, spacing: 10) {
             bottomControls
@@ -257,6 +290,20 @@ struct ScheduleScreen: View {
         }
         .task(id: scheduleMonthKey(selectedDate)) {
             await store.loadIfNeeded(for: selectedDate)
+        }
+        .onChange(of: selectedDate) { oldValue, newValue in
+            monthScrollerID = scheduleMonthKey(newValue)
+            dayScrollerID = scheduleISODate(preferredDayScrollDate(oldValue: oldValue, newValue: newValue))
+        }
+        .onAppear {
+            guard !monthTabsInitialized else { return }
+            monthTabsInitialized = true
+            monthScrollerID = scheduleMonthKey(selectedDate)
+            dayScrollerID = scheduleISODate(preferredDayScrollDate(oldValue: selectedDate, newValue: selectedDate))
+        }
+        .onChange(of: store.staff.map(\.id)) { _, newValue in
+            guard let selectedStaffID, !newValue.contains(selectedStaffID) else { return }
+            self.selectedStaffID = nil
         }
     }
 
@@ -283,14 +330,36 @@ struct ScheduleScreen: View {
 
                 Spacer(minLength: 12)
 
-                Button {
-                    Task { await store.reload(for: selectedDate) }
+                Menu {
+                    Button {
+                        selectedStaffID = nil
+                    } label: {
+                        if selectedStaffID == nil {
+                            Label("Все", systemImage: "checkmark")
+                        } else {
+                            Text("Все")
+                        }
+                    }
+
+                    ForEach(store.staff) { person in
+                        Button {
+                            selectedStaffID = person.id
+                        } label: {
+                            if selectedStaffID == person.id {
+                                Label(person.name, systemImage: "checkmark")
+                            } else {
+                                Text(person.name)
+                            }
+                        }
+                    }
                 } label: {
                     HStack(spacing: 8) {
                         Image(systemName: "person.2")
                             .font(.system(size: 13, weight: .semibold))
-                        Text("Все")
+                        Text(selectedStaffTitle)
                             .font(.subheadline.weight(.bold))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 10, weight: .bold))
                     }
                     .foregroundStyle(MariPalette.softInk)
                     .padding(.horizontal, 12)
@@ -298,9 +367,9 @@ struct ScheduleScreen: View {
                     .background(
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
                             .fill(.white.opacity(0.76))
-                    )
+                        )
                 }
-                .buttonStyle(.plain)
+                .menuStyle(.button)
             }
 
             Divider()
@@ -309,31 +378,55 @@ struct ScheduleScreen: View {
     }
 
     private var weekGrid: some View {
-        ScrollView(.horizontal) {
-            VStack(alignment: .leading, spacing: 10) {
-                weekHeaderRow
+        HStack(alignment: .top, spacing: ScheduleGridLayout.gap) {
+            fixedStaffColumn
 
-                ForEach(visibleStaff) { person in
-                    ScheduleStaffWeekRow(
-                        staff: person,
-                        dates: weekDates,
-                        selectedDate: selectedDate,
-                        slotsProvider: { slots(for: person.id, date: $0) }
-                    )
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        weekHeaderRow
+
+                        ForEach(visibleStaff) { person in
+                            ScheduleStaffDaysRow(
+                                dates: monthDates,
+                                selectedDate: selectedDate,
+                                today: today,
+                                slotsProvider: { slots(for: person.id, date: $0) }
+                            )
+                        }
+                    }
+                    .frame(width: dayGridWidth, alignment: .leading)
+                    .padding(.vertical, 6)
+                    .scrollTargetLayout()
+                }
+                .scrollIndicators(.hidden)
+                .scrollTargetBehavior(.viewAligned)
+                .onAppear {
+                    scrollDays(using: proxy, targetID: dayScrollerID)
+                }
+                .onChange(of: dayScrollerID) { _, newValue in
+                    scrollDays(using: proxy, targetID: newValue)
                 }
             }
-            .frame(width: gridWidth, alignment: .leading)
-            .padding(.vertical, 6)
         }
-        .scrollIndicators(.hidden)
+    }
+
+    private var fixedStaffColumn: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Color.clear
+                .frame(width: ScheduleGridLayout.staffColumnWidth, height: ScheduleGridLayout.headerHeight)
+
+            ForEach(visibleStaff) { person in
+                ScheduleStaffInfoCell(staff: person)
+                    .frame(height: ScheduleGridLayout.rowHeight, alignment: .top)
+            }
+        }
+        .padding(.vertical, 6)
     }
 
     private var weekHeaderRow: some View {
         HStack(alignment: .bottom, spacing: ScheduleGridLayout.gap) {
-            Color.clear
-                .frame(width: ScheduleGridLayout.staffColumnWidth, height: 40)
-
-            ForEach(weekDates, id: \.self) { date in
+            ForEach(monthDates, id: \.self) { date in
                 let isSelected = calendar.isDate(date, inSameDayAs: selectedDate)
 
                 VStack(spacing: 4) {
@@ -343,60 +436,65 @@ struct ScheduleScreen: View {
 
                     Text(scheduleShortWeekday(date))
                         .font(.caption.weight(.bold))
-                        .foregroundStyle(MariPalette.softInk.opacity(0.85))
+                        .foregroundStyle(isSelected ? MariPalette.accent : MariPalette.softInk.opacity(0.85))
                 }
-                .frame(width: ScheduleGridLayout.dayColumnWidth)
+                .frame(width: ScheduleGridLayout.dayColumnWidth, height: ScheduleGridLayout.headerHeight, alignment: .bottom)
+                .id(scheduleISODate(date))
             }
         }
     }
 
     private var bottomControls: some View {
-        VStack(spacing: 12) {
-            Button {
-                isEditAlertPresented = true
-            } label: {
-                Text("Редактировать график")
-                    .font(.headline.weight(.black))
-                    .foregroundStyle(Color(hex: 0xD2B85E))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 18)
-                    .background(
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .fill(Color(hex: 0xFFE98E))
-                    )
-            }
-            .buttonStyle(.plain)
-
-            HStack(spacing: 0) {
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: 0) {
                 ForEach(monthTabs) { tab in
                     Button {
                         selectedDate = scheduleDateByChangingMonth(from: selectedDate, to: tab.date)
+                        monthScrollerID = tab.id
                     } label: {
-                        VStack(spacing: 2) {
+                        VStack(spacing: 1) {
                             Text(scheduleMonthTabLabel(tab.date))
-                                .font(.headline.weight(.black))
+                                .font(.system(size: 13, weight: .black))
                             if tab.isSelected {
                                 Text(tab.date.formatted(.dateTime.year()))
-                                    .font(.caption2.weight(.bold))
+                                    .font(.system(size: 9, weight: .bold))
                             }
                         }
                         .foregroundStyle(tab.isSelected ? MariPalette.ink : Color.white.opacity(0.74))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
+                        .frame(width: 82)
+                        .padding(.vertical, 10)
                         .background(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
                                 .fill(tab.isSelected ? Color(hex: 0xF8CC47) : .clear)
-                                .padding(4)
+                                .padding(3)
                         )
                     }
                     .buttonStyle(.plain)
+                    .id(tab.id)
                 }
             }
-            .background(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(Color(hex: 0x262B31))
-            )
+            .scrollTargetLayout()
         }
+        .frame(height: 60)
+        .scrollIndicators(.hidden)
+        .scrollTargetBehavior(.viewAligned)
+        .contentMargins(.horizontal, 4, for: .scrollContent)
+        .safeAreaPadding(.horizontal, 0)
+        .scrollPosition(id: $monthScrollerID, anchor: .center)
+        .onChange(of: monthScrollerID) { _, newValue in
+            guard let newValue,
+                  let tab = monthTabs.first(where: { $0.id == newValue }),
+                  !calendar.isDate(tab.date, equalTo: selectedDate, toGranularity: .month)
+            else {
+                return
+            }
+
+            selectedDate = scheduleDateByChangingMonth(from: selectedDate, to: tab.date)
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(hex: 0x262B31))
+        )
     }
 
     private func slots(for staffID: String, date: Date) -> [MariAPIClient.WorkingHoursItem] {
@@ -409,59 +507,94 @@ struct ScheduleScreen: View {
                 return $0.startTime < $1.startTime
             }
     }
+
+    private func preferredDayScrollDate(oldValue: Date, newValue: Date) -> Date {
+        if calendar.isDate(newValue, equalTo: today, toGranularity: .month) {
+            if newValue < today {
+                return today
+            }
+
+            if !calendar.isDate(oldValue, equalTo: newValue, toGranularity: .month) {
+                return today
+            }
+        }
+
+        return newValue
+    }
+
+    private func scrollDays(using proxy: ScrollViewProxy, targetID: String?) {
+        guard let targetID else { return }
+
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.2)) {
+                proxy.scrollTo(targetID, anchor: .leading)
+            }
+        }
+    }
 }
 
-private struct ScheduleStaffWeekRow: View {
+
+private struct ScheduleStaffInfoCell: View {
     let staff: MariAPIClient.StaffRecord
-    let dates: [Date]
-    let selectedDate: Date
-    let slotsProvider: (Date) -> [MariAPIClient.WorkingHoursItem]
 
     private var positionTitle: String {
         staff.position?.name ?? "Мастер"
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: ScheduleGridLayout.gap) {
-            VStack(spacing: 6) {
-                ZStack(alignment: .bottomTrailing) {
-                    Circle()
-                        .fill(Color(hex: 0xEEE9FF))
-                        .frame(width: 36, height: 36)
+        VStack(spacing: 4) {
+            ZStack(alignment: .bottomTrailing) {
+                Circle()
+                    .fill(Color(hex: 0xEEE9FF))
+                    .frame(width: 34, height: 34)
 
-                    Text(initials(for: staff.name))
-                        .font(.caption.weight(.black))
-                        .foregroundStyle(MariPalette.softInk)
+                Text(initials(for: staff.name))
+                    .font(.system(size: 11, weight: .black))
+                    .foregroundStyle(MariPalette.softInk)
 
-                    Circle()
-                        .fill(MariPalette.accent)
-                        .frame(width: 12, height: 12)
-                        .overlay(
-                            Image(systemName: "pencil")
-                                .font(.system(size: 6, weight: .black))
-                                .foregroundStyle(.white)
-                        )
-                        .offset(x: 2, y: 2)
-                }
-
-                VStack(spacing: 2) {
-                    Text(firstName(staff.name))
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(MariPalette.ink)
-                        .lineLimit(1)
-
-                    Text(positionTitle)
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(MariPalette.softInk.opacity(0.7))
-                        .lineLimit(1)
-                }
+                Circle()
+                    .fill(MariPalette.accent)
+                    .frame(width: 11, height: 11)
+                    .overlay(
+                        Image(systemName: "pencil")
+                            .font(.system(size: 5.5, weight: .black))
+                            .foregroundStyle(.white)
+                    )
+                    .offset(x: 2, y: 2)
             }
-            .frame(width: ScheduleGridLayout.staffColumnWidth)
 
+            VStack(spacing: 1) {
+                Text(firstName(staff.name))
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(MariPalette.ink)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+
+                Text(positionTitle)
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundStyle(MariPalette.softInk.opacity(0.7))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+        }
+        .frame(width: ScheduleGridLayout.staffColumnWidth)
+    }
+}
+
+private struct ScheduleStaffDaysRow: View {
+    let dates: [Date]
+    let selectedDate: Date
+    let today: Date
+    let slotsProvider: (Date) -> [MariAPIClient.WorkingHoursItem]
+
+    var body: some View {
+        HStack(alignment: .top, spacing: ScheduleGridLayout.gap) {
             ForEach(dates, id: \.self) { date in
                 ScheduleDayCell(
                     slots: slotsProvider(date),
-                    isSelectedDay: Calendar(identifier: .gregorian).isDate(date, inSameDayAs: selectedDate)
+                    isSelectedDay: Calendar(identifier: .gregorian).isDate(date, inSameDayAs: selectedDate),
+                    isToday: Calendar(identifier: .gregorian).isDate(date, inSameDayAs: today),
+                    isPastDay: date < today
                 )
             }
         }
@@ -471,6 +604,12 @@ private struct ScheduleStaffWeekRow: View {
 private struct ScheduleDayCell: View {
     let slots: [MariAPIClient.WorkingHoursItem]
     let isSelectedDay: Bool
+    let isToday: Bool
+    let isPastDay: Bool
+
+    private var effectiveOpacity: Double {
+        isPastDay && !slots.isEmpty ? 0.5 : 1
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -491,52 +630,67 @@ private struct ScheduleDayCell: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(isSelectedDay ? MariPalette.accent.opacity(0.9) : .white.opacity(0.28), lineWidth: isSelectedDay ? 1.5 : 1)
+                .stroke(
+                    isToday ? .clear : (isSelectedDay ? MariPalette.accent.opacity(0.9) : .white.opacity(0.28)),
+                    lineWidth: isToday ? 0 : (isSelectedDay ? 1.5 : 1)
+                )
         )
+        .opacity(effectiveOpacity)
     }
 }
 
 private struct ScheduleInitialSkeleton: View {
-    let gridWidth: CGFloat
+    let dayGridWidth: CGFloat
 
     var body: some View {
-        ScrollView(.horizontal) {
+        HStack(alignment: .top, spacing: ScheduleGridLayout.gap) {
             VStack(alignment: .leading, spacing: 10) {
-                HStack(alignment: .bottom, spacing: ScheduleGridLayout.gap) {
-                    MariSkeletonBlock(width: ScheduleGridLayout.staffColumnWidth, height: 40, cornerRadius: 14)
-
-                    ForEach(0..<7, id: \.self) { _ in
-                        VStack(spacing: 4) {
-                            MariSkeletonBlock(width: 26, height: 20, cornerRadius: 10)
-                            MariSkeletonBlock(width: 22, height: 12, cornerRadius: 6)
-                        }
-                        .frame(width: ScheduleGridLayout.dayColumnWidth)
-                    }
-                }
+                MariSkeletonBlock(
+                    width: ScheduleGridLayout.staffColumnWidth,
+                    height: ScheduleGridLayout.headerHeight,
+                    cornerRadius: 14
+                )
 
                 ForEach(0..<4, id: \.self) { _ in
-                    HStack(alignment: .top, spacing: ScheduleGridLayout.gap) {
-                        VStack(spacing: 8) {
-                            MariSkeletonCircle(size: 36)
-                            MariSkeletonBlock(width: 58, height: 12, cornerRadius: 6)
-                            MariSkeletonBlock(width: 46, height: 10, cornerRadius: 6)
-                        }
-                        .frame(width: ScheduleGridLayout.staffColumnWidth)
+                    VStack(spacing: 8) {
+                        MariSkeletonCircle(size: 36)
+                        MariSkeletonBlock(width: 58, height: 12, cornerRadius: 6)
+                        MariSkeletonBlock(width: 46, height: 10, cornerRadius: 6)
+                    }
+                    .frame(width: ScheduleGridLayout.staffColumnWidth, height: ScheduleGridLayout.rowHeight, alignment: .top)
+                }
+            }
+            .padding(.vertical, 6)
 
+            ScrollView(.horizontal) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .bottom, spacing: ScheduleGridLayout.gap) {
                         ForEach(0..<7, id: \.self) { _ in
-                            MariSkeletonBlock(
-                                width: ScheduleGridLayout.dayColumnWidth,
-                                height: ScheduleGridLayout.rowHeight,
-                                cornerRadius: 14
-                            )
+                            VStack(spacing: 4) {
+                                MariSkeletonBlock(width: 26, height: 20, cornerRadius: 10)
+                                MariSkeletonBlock(width: 22, height: 12, cornerRadius: 6)
+                            }
+                            .frame(width: ScheduleGridLayout.dayColumnWidth, height: ScheduleGridLayout.headerHeight, alignment: .bottom)
+                        }
+                    }
+
+                    ForEach(0..<4, id: \.self) { _ in
+                        HStack(alignment: .top, spacing: ScheduleGridLayout.gap) {
+                            ForEach(0..<7, id: \.self) { _ in
+                                MariSkeletonBlock(
+                                    width: ScheduleGridLayout.dayColumnWidth,
+                                    height: ScheduleGridLayout.rowHeight,
+                                    cornerRadius: 14
+                                )
+                            }
                         }
                     }
                 }
+                .frame(width: dayGridWidth, alignment: .leading)
+                .padding(.vertical, 6)
             }
-            .frame(width: gridWidth, alignment: .leading)
-            .padding(.vertical, 6)
+            .scrollIndicators(.hidden)
         }
-        .scrollIndicators(.hidden)
     }
 }
 
@@ -682,7 +836,9 @@ private func scheduleMonthTabLabel(_ date: Date) -> String {
     let formatter = DateFormatter()
     formatter.locale = MariLocale.ru
     formatter.dateFormat = "LLL"
-    return formatter.string(from: date).lowercased()
+    return formatter.string(from: date)
+        .replacingOccurrences(of: ".", with: "")
+        .lowercased()
 }
 
 private func scheduleDateByChangingMonth(from source: Date, to targetMonth: Date) -> Date {

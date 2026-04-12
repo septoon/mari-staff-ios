@@ -360,7 +360,7 @@ struct OnlineBookingScreen: View {
                     OnlineBookingHeader(
                         title: "Онлайн-запись",
                         isRefreshing: store.isLoading,
-                        onRefresh: { Task { await store.reload() } }
+                        onRefresh: { await store.reload() }
                     )
 
                     if let banner = store.banner {
@@ -399,13 +399,13 @@ struct OnlineBookingScreen: View {
             .padding(.bottom, 24)
         }
         .scrollIndicators(.hidden)
+        .mariPullToRefresh {
+            await store.reload()
+        }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
         .task {
             await store.loadIfNeeded()
-        }
-        .refreshable {
-            await store.reload()
         }
     }
 
@@ -646,7 +646,7 @@ private struct OnlineBookingSectionCard: View {
 private struct OnlineBookingHeader<Trailing: View>: View {
     let title: String
     let isRefreshing: Bool
-    let onRefresh: () -> Void
+    let onRefresh: () async -> Void
     @ViewBuilder let trailing: Trailing
 
     @Environment(\.dismiss) private var dismiss
@@ -654,7 +654,7 @@ private struct OnlineBookingHeader<Trailing: View>: View {
     init(
         title: String,
         isRefreshing: Bool = false,
-        onRefresh: @escaping () -> Void = {},
+        onRefresh: @escaping () async -> Void = {},
         @ViewBuilder trailing: () -> Trailing = { EmptyView() }
     ) {
         self.title = title
@@ -685,7 +685,9 @@ private struct OnlineBookingHeader<Trailing: View>: View {
 
             HStack(spacing: 10) {
                 Button {
-                    onRefresh()
+                    Task {
+                        await onRefresh()
+                    }
                 } label: {
                     if isRefreshing {
                         ProgressView()
@@ -758,7 +760,7 @@ private struct OnlineBookingInitialSkeleton: View {
 private struct OnlineBookingFormScreen<Content: View>: View {
     let title: String
     let isSaving: Bool
-    let onRefresh: () -> Void
+    let onRefresh: () async -> Void
     @ViewBuilder let content: Content
 
     var body: some View {
@@ -771,6 +773,9 @@ private struct OnlineBookingFormScreen<Content: View>: View {
             .padding(.bottom, 24)
         }
         .scrollIndicators(.hidden)
+        .mariPullToRefresh {
+            await onRefresh()
+        }
         .background(MariBackground().ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
     }
@@ -917,7 +922,7 @@ private struct OnlineBookingHomeEditorScreen: View {
     }
 
     var body: some View {
-        OnlineBookingFormScreen(title: "Главная страница", isSaving: store.isSaving, onRefresh: {}) {
+        OnlineBookingFormScreen(title: "Главная страница", isSaving: store.isSaving, onRefresh: { await store.reload() }) {
             if let banner = store.banner {
                 OnlineBookingBannerView(banner: banner)
             }
@@ -957,7 +962,7 @@ private struct OnlineBookingPageEditorScreen: View {
     }
 
     var body: some View {
-        OnlineBookingFormScreen(title: "Страница записи", isSaving: store.isSaving, onRefresh: {}) {
+        OnlineBookingFormScreen(title: "Страница записи", isSaving: store.isSaving, onRefresh: { await store.reload() }) {
             if let banner = store.banner {
                 OnlineBookingBannerView(banner: banner)
             }
@@ -1005,7 +1010,7 @@ private struct OnlineBookingContactsScreen: View {
     }
 
     var body: some View {
-        OnlineBookingFormScreen(title: "Контакты", isSaving: store.isSaving, onRefresh: {}) {
+        OnlineBookingFormScreen(title: "Контакты", isSaving: store.isSaving, onRefresh: { await store.reload() }) {
             if let banner = store.banner {
                 OnlineBookingBannerView(banner: banner)
             }
@@ -1044,7 +1049,7 @@ private struct OnlineBookingSpecialistsScreen: View {
     @ObservedObject var store: OnlineBookingStore
 
     var body: some View {
-        OnlineBookingFormScreen(title: "Специалисты", isSaving: store.isSaving, onRefresh: {}) {
+        OnlineBookingFormScreen(title: "Специалисты", isSaving: store.isSaving, onRefresh: { await store.reload() }) {
             if let banner = store.banner {
                 OnlineBookingBannerView(banner: banner)
             }
@@ -1082,7 +1087,7 @@ private struct OnlineBookingSpecialistEditorScreen: View {
     }
 
     var body: some View {
-        OnlineBookingFormScreen(title: draft.name, isSaving: store.isSaving, onRefresh: {}) {
+        OnlineBookingFormScreen(title: draft.name, isSaving: store.isSaving, onRefresh: { await store.reload() }) {
             if let banner = store.banner {
                 OnlineBookingBannerView(banner: banner)
             }
@@ -1199,7 +1204,7 @@ private struct OnlineBookingServicesScreen: View {
     }
 
     var body: some View {
-        OnlineBookingFormScreen(title: "Услуги", isSaving: store.isSaving, onRefresh: {}) {
+        OnlineBookingFormScreen(title: "Услуги", isSaving: store.isSaving, onRefresh: { await store.reload() }) {
             OnlineBookingPanel(
                 title: "Витрина онлайн-записи",
                 subtitle: "Реальные услуги берутся из /services. Полное редактирование самих услуг остается в отдельном модуле."
@@ -1236,7 +1241,7 @@ private struct OnlineBookingPromoScreen: View {
     @ObservedObject var store: OnlineBookingStore
 
     var body: some View {
-        OnlineBookingFormScreen(title: "Акции и предложения", isSaving: store.isSaving, onRefresh: {}) {
+        OnlineBookingFormScreen(title: "Акции и предложения", isSaving: store.isSaving, onRefresh: { await store.reload() }) {
             if let banner = store.banner {
                 OnlineBookingBannerView(banner: banner)
             }
@@ -1271,7 +1276,7 @@ private struct OnlineBookingBlockEditorScreen: View {
     }
 
     var body: some View {
-        OnlineBookingFormScreen(title: draft.blockKey, isSaving: store.isSaving, onRefresh: {}) {
+        OnlineBookingFormScreen(title: draft.blockKey, isSaving: store.isSaving, onRefresh: { await store.reload() }) {
             if let banner = store.banner {
                 OnlineBookingBannerView(banner: banner)
             }
@@ -1337,7 +1342,7 @@ private struct OnlineBookingLegalScreen: View {
     @ObservedObject var store: OnlineBookingStore
 
     var body: some View {
-        OnlineBookingFormScreen(title: "Политика", isSaving: store.isSaving, onRefresh: {}) {
+        OnlineBookingFormScreen(title: "Политика", isSaving: store.isSaving, onRefresh: { await store.reload() }) {
             OnlineBookingPanel(
                 title: "Privacy policy",
                 subtitle: "В web этот контент связан с client-front и privacy settings."
@@ -1361,7 +1366,7 @@ private struct OnlineBookingAdvancedScreen: View {
     }
 
     var body: some View {
-        OnlineBookingFormScreen(title: "Служебные настройки", isSaving: store.isSaving, onRefresh: {}) {
+        OnlineBookingFormScreen(title: "Служебные настройки", isSaving: store.isSaving, onRefresh: { await store.reload() }) {
             if let banner = store.banner {
                 OnlineBookingBannerView(banner: banner)
             }
@@ -1392,7 +1397,7 @@ private struct OnlineBookingPublishScreen: View {
     @ObservedObject var store: OnlineBookingStore
 
     var body: some View {
-        OnlineBookingFormScreen(title: "Состояние сайта", isSaving: store.isSaving, onRefresh: {}) {
+        OnlineBookingFormScreen(title: "Состояние сайта", isSaving: store.isSaving, onRefresh: { await store.reload() }) {
             if let banner = store.banner {
                 OnlineBookingBannerView(banner: banner)
             }
